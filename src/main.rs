@@ -1,4 +1,9 @@
 mod config;
+mod event_loop;
+mod server;
+
+use event_loop::{dispatcher, epoll::Epoll, registry::Registry};
+use server::listener::bind_listeners;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -10,6 +15,7 @@ fn main() {
         }
     };
 
+    // ---- 1. Parse and validate config --------------------------------------
     let configs = match config::load(config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -18,9 +24,9 @@ fn main() {
         }
     };
 
-    println!("[INFO] Loaded {} server block(s):", configs.len());
+    eprintln!("[INFO] Loaded {} server block(s):", configs.len());
     for (i, s) in configs.iter().enumerate() {
-        println!(
+        eprintln!(
             "  [{}] {}:{:?}  routes: {}  body-limit: {} bytes",
             i + 1,
             s.host,
@@ -30,6 +36,30 @@ fn main() {
         );
     }
 
-    // Event loop will be wired in here in a future step.
-    todo!("event loop not yet implemented");
+    // ---- 2. Create epoll instance ------------------------------------------
+    let epoll = match Epoll::create() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[ERROR] Failed to create epoll: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // ---- 3. Bind all listening sockets -------------------------------------
+    let mut registry = Registry::new();
+    match bind_listeners(&configs, &epoll, &mut registry) {
+        Ok(bound) => {
+            eprintln!("[INFO] Bound {} listener(s):", bound.len());
+            for (fd, addr) in &bound {
+                eprintln!("  fd={fd}  addr={addr}");
+            }
+        }
+        Err(e) => {
+            eprintln!("[ERROR] Failed to bind listeners: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // ---- 4. Enter the event loop (never returns) ---------------------------
+    dispatcher::run(epoll, registry, configs);
 }
