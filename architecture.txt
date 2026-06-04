@@ -1,0 +1,359 @@
+Localhost — Rust HTTP Server: Architecture Plan
+Design Philosophy
+
+Single-threaded, non-blocking I/O via epoll event loop
+State machine per connection — each connection tracks its own parse/write state
+Zero-crash guarantee — all errors propagated, never panicked on client input
+Modular crates-within-project structure for testability
+
+
+File Structure
+localhost/
+├── Cargo.toml
+├── Cargo.lock
+├── config/
+│   └── default.conf              # Example configuration file
+├── www/                          # Default static web root
+│   ├── index.html
+│   └── errors/
+│       ├── 400.html
+│       ├── 403.html
+│       ├── 404.html
+│       ├── 405.html
+│       ├── 413.html
+│       └── 500.html
+├── cgi-bin/
+│   └── hello.py                  # Example CGI script
+├── tests/
+│   ├── integration/
+│   │   ├── test_get.rs
+│   │   ├── test_post.rs
+│   │   ├── test_delete.rs
+│   │   ├── test_upload.rs
+│   │   ├── test_cgi.rs
+│   │   ├── test_redirects.rs
+│   │   ├── test_errors.rs
+│   │   └── test_chunked.rs
+│   └── common/
+│       └── mod.rs                # Shared test helpers
+└── src/
+    ├── main.rs                   # Entry point
+    ├── lib.rs                    # Re-exports, top-level wiring
+    │
+    ├── config/
+    │   ├── mod.rs
+    │   ├── parser.rs             # Config file parser
+    │   ├── types.rs              # ServerConfig, RouteConfig, etc.
+    │   └── validator.rs          # Validate config after parsing
+    │
+    ├── event_loop/
+    │   ├── mod.rs
+    │   ├── epoll.rs              # Raw epoll wrapper (unsafe)
+    │   ├── registry.rs           # Fd → ConnectionState map
+    │   └── dispatcher.rs        # Event dispatch logic
+    │
+    ├── server/
+    │   ├── mod.rs
+    │   ├── listener.rs           # TCP listener setup per port
+    │   ├── connection.rs         # Per-connection state machine
+    │   └── timeout.rs            # Timeout tracking per fd
+    │
+    ├── http/
+    │   ├── mod.rs
+    │   ├── request/
+    │   │   ├── mod.rs
+    │   │   ├── parser.rs         # Incremental HTTP/1.1 request parser
+    │   │   ├── types.rs          # Request, Method, Headers, etc.
+    │   │   └── body.rs           # Body reading: chunked + unchunked
+    │   └── response/
+    │       ├── mod.rs
+    │       ├── builder.rs        # Response construction
+    │       ├── types.rs          # Response, StatusCode, etc.
+    │       └── writer.rs         # Non-blocking response writer
+    │
+    ├── router/
+    │   ├── mod.rs
+    │   ├── matcher.rs            # Route matching logic
+    │   └── handler.rs            # Dispatch to correct handler
+    │
+    ├── handlers/
+    │   ├── mod.rs
+    │   ├── static_file.rs        # GET static file serving
+    │   ├── upload.rs             # POST file upload handling
+    │   ├── delete.rs             # DELETE resource handling
+    │   ├── directory.rs          # Directory listing
+    │   ├── redirect.rs           # HTTP redirect responses
+    │   └── error.rs              # Error page rendering
+    │
+    ├── cgi/
+    │   ├── mod.rs
+    │   ├── executor.rs           # fork/exec CGI process
+    │   ├── env.rs                # CGI environment variables
+    │   └── io.rs                 # CGI stdin/stdout piping
+    │
+    ├── session/
+    │   ├── mod.rs
+    │   ├── store.rs              # In-memory session store
+    │   └── cookie.rs             # Cookie parsing and generation
+    │
+    └── utils/
+        ├── mod.rs
+        ├── mime.rs               # MIME type resolution
+        ├── path.rs               # Safe path traversal utilities
+        └── logger.rs             # Structured stderr logging
+
+Module Breakdown
+main.rs
+fn main()
+  - Load and validate config from argv[1]
+  - Initialize logger
+  - Bind all listener sockets
+  - Hand off to event_loop::run()
+config/types.rs
+struct ServerConfig
+  fields: host, ports[], server_names[], error_pages{}, client_body_limit, routes[]
+
+struct RouteConfig
+  fields: path, methods[], redirect Option<Redirect>, root, default_file,
+          cgi_extensions{}, directory_listing, index_file
+
+struct Redirect
+  fields: code u16, target String
+config/parser.rs
+fn parse_file(path: &str) -> Result<Vec<ServerConfig>, ConfigError>
+fn parse_server_block(lines) -> Result<ServerConfig, ConfigError>
+fn parse_route_block(lines) -> Result<RouteConfig, ConfigError>
+config/validator.rs
+fn validate(configs: &[ServerConfig]) -> Result<(), ConfigError>
+  - No duplicate host:port without distinct server_name
+  - All referenced error page paths exist
+  - All roots are valid directories
+
+event_loop/epoll.rs
+struct Epoll { fd: RawFd }
+
+impl Epoll
+  fn create() -> Result<Self>
+  fn add(fd: RawFd, events: u32, token: u64) -> Result<()>
+  fn modify(fd: RawFd, events: u32, token: u64) -> Result<()>
+  fn delete(fd: RawFd) -> Result<()>
+  fn wait(events: &mut [EpollEvent], timeout_ms: i32) -> Result<usize>
+event_loop/registry.rs
+struct Registry
+  fn register_listener(fd, server_id)
+  fn register_connection(fd, ConnectionState)
+  fn get_connection_mut(fd) -> Option<&mut ConnectionState>
+  fn remove(fd)
+  fn all_connection_fds() -> Vec<RawFd>
+event_loop/dispatcher.rs
+fn run(epoll: Epoll, registry: Registry, configs: Vec<ServerConfig>) -> !
+  - Main loop: epoll.wait() → dispatch each event
+  - EPOLLIN on listener fd → accept_new_connection()
+  - EPOLLIN on conn fd     → read_from_connection()
+  - EPOLLOUT on conn fd    → write_to_connection()
+  - EPOLLERR/HUP           → close_connection()
+  - Per-tick: check_timeouts()
+
+fn accept_new_connection(listener_fd, epoll, registry)
+fn read_from_connection(fd, epoll, registry, configs)
+fn write_to_connection(fd, epoll, registry)
+fn close_connection(fd, epoll, registry)
+fn check_timeouts(registry, epoll)
+
+server/connection.rs
+enum ConnectionPhase
+  ReadingHeaders
+  ReadingBody { bytes_read, expected }
+  ReadingChunked { chunk_state }
+  Processing          ← synchronous handler runs here
+  WritingResponse { bytes_written }
+  AwaitingCgi { child_pid, pipe_fd }
+  Done
+
+struct ConnectionState
+  fields: fd, phase, read_buf, write_buf, request Option<Request>,
+          response Option<Response>, server_id, last_activity Instant,
+          peer_addr
+
+impl ConnectionState
+  fn new(fd, server_id, peer_addr) -> Self
+  fn advance(&mut self, configs) -> Result<StateTransition>
+  fn is_timed_out(&self, timeout: Duration) -> bool
+server/timeout.rs
+const READ_TIMEOUT: Duration
+const WRITE_TIMEOUT: Duration
+const CGI_TIMEOUT: Duration
+
+fn check_all(registry: &mut Registry, epoll: &Epoll, timeout: Duration)
+  - Iterates connections, closes those exceeding timeout
+  - Sends 408 if still in reading phase
+
+http/request/parser.rs
+enum ParseResult
+  Complete(Request)
+  Incomplete
+  Error(ParseError)
+
+fn parse_request_head(buf: &[u8]) -> ParseResult
+  - Finds \r\n\r\n boundary
+  - Calls parse_request_line() + parse_headers()
+
+fn parse_request_line(line: &str) -> Result<(Method, String, Version)>
+fn parse_headers(lines: &[&str]) -> Result<HeaderMap>
+http/request/body.rs
+fn read_body_unchunked(buf: &[u8], content_length: usize) -> Result<Vec<u8>>
+
+fn read_body_chunked(buf: &[u8]) -> Result<ChunkedResult>
+  - Parses chunk-size\r\n + chunk-data\r\n pairs
+  - Returns assembled body or NeedsMore
+
+struct ChunkedResult
+  Complete(Vec<u8>)
+  NeedsMore
+http/response/builder.rs
+fn ok(body: Vec<u8>, mime: &str) -> Response
+fn not_found(error_page: Option<&str>) -> Response
+fn method_not_allowed(allowed: &[Method]) -> Response
+fn redirect(code: u16, location: &str) -> Response
+fn error(code: u16, body: Vec<u8>) -> Response
+fn from_cgi_output(raw: Vec<u8>) -> Result<Response>
+http/response/writer.rs
+fn serialize(response: &Response) -> Vec<u8>
+  - Writes status line, headers, blank line, body
+
+fn write_nonblocking(fd: RawFd, buf: &[u8], offset: usize) -> WriteResult
+  - Returns BytesWritten(n) or WouldBlock or Error
+
+router/matcher.rs
+fn match_route<'a>(path: &str, routes: &'a [RouteConfig]) -> Option<&'a RouteConfig>
+  - Longest prefix match
+  - Exact match takes precedence
+
+fn select_server<'a>(host_header: &str, port: u16, configs: &'a [ServerConfig])
+  -> &'a ServerConfig
+  - Matches server_name, falls back to first for host:port
+router/handler.rs
+fn dispatch(request: &Request, route: &RouteConfig, server: &ServerConfig)
+  -> Result<Response>
+  - Checks method allowed
+  - Checks redirect
+  - Checks CGI extension
+  - Delegates to handlers::*
+
+handlers/static_file.rs
+fn serve(request: &Request, route: &RouteConfig) -> Result<Response>
+  - Resolves URL path to filesystem path via route root
+  - Path traversal safety check
+  - Reads file, resolves MIME type
+  - Returns 200 with body or 404
+handlers/upload.rs
+fn handle(request: &Request, route: &RouteConfig, size_limit: usize)
+  -> Result<Response>
+  - Validates Content-Type: multipart/form-data or application/octet-stream
+  - Writes file to configured upload directory
+  - Returns 201 Created
+handlers/directory.rs
+fn list(fs_path: &Path, url_path: &str) -> Result<Response>
+  - Reads directory entries
+  - Renders HTML index listing
+  - Returns 200
+handlers/error.rs
+fn render(code: u16, custom_page: Option<&str>) -> Response
+  - Reads custom error page if configured
+  - Falls back to built-in default HTML
+
+cgi/executor.rs
+fn spawn(script_path: &Path, request: &Request, route: &RouteConfig)
+  -> Result<CgiProcess>
+  - fork() + exec() the interpreter
+  - Sets up stdin pipe (request body) and stdout pipe (response)
+  - Returns CgiProcess with child pid and pipe fds
+
+struct CgiProcess
+  fields: pid, stdin_fd, stdout_fd
+
+fn poll_output(proc: &CgiProcess) -> Result<CgiPollResult>
+  - Non-blocking read from stdout_fd
+  - CgiPollResult: Pending | Complete(Vec<u8>) | Error
+cgi/env.rs
+fn build_env(request: &Request, script_path: &Path, server: &ServerConfig)
+  -> Vec<(String, String)>
+  - Sets: REQUEST_METHOD, PATH_INFO, QUERY_STRING, CONTENT_TYPE,
+          CONTENT_LENGTH, SERVER_NAME, SERVER_PORT, SCRIPT_FILENAME,
+          HTTP_* headers
+
+session/store.rs
+struct SessionStore
+  fn new() -> Self
+  fn create() -> SessionId               // generates random ID
+  fn get(id: &SessionId) -> Option<&SessionData>
+  fn get_mut(id: &SessionId) -> Option<&mut SessionData>
+  fn destroy(id: &SessionId)
+  fn purge_expired()                     // called periodically from event loop
+session/cookie.rs
+fn parse_cookies(header: &str) -> HashMap<String, String>
+fn set_cookie_header(name: &str, value: &str, opts: &CookieOptions) -> String
+fn extract_session_id(cookies: &HashMap<String, String>) -> Option<SessionId>
+
+utils/mime.rs
+fn from_extension(ext: &str) -> &'static str
+  - Maps .html→text/html, .css→text/css, .js→application/javascript,
+         .png→image/png, .jpg→image/jpeg, .pdf→application/pdf, etc.
+  - Falls back to application/octet-stream
+utils/path.rs
+fn resolve_safe(root: &Path, url_path: &str) -> Result<PathBuf, PathError>
+  - Joins root + url_path
+  - Canonicalizes and verifies result is still under root
+  - Prevents directory traversal (../ attacks)
+
+Key Data Flow
+epoll event
+    │
+    ▼
+dispatcher::run()
+    │
+    ├─ Listener fd  ──► accept() ──► new ConnectionState ──► register EPOLLIN
+    │
+    └─ Connection fd
+           │
+           ├─ EPOLLIN  ──► read into read_buf
+           │               ──► request::parser::parse_request_head()
+           │               ──► body::read_body_*()
+           │               ──► router::matcher::select_server()
+           │               ──► router::matcher::match_route()
+           │               ──► router::handler::dispatch()
+           │                       │
+           │                       ├─ static  ──► handlers::static_file
+           │                       ├─ upload  ──► handlers::upload
+           │                       ├─ delete  ──► handlers::delete
+           │                       ├─ dir     ──► handlers::directory
+           │                       ├─ cgi     ──► cgi::executor::spawn()
+           │                       │               ──► register CGI stdout_fd in epoll
+           │                       └─ error   ──► handlers::error
+           │               ──► response::writer::serialize() → write_buf
+           │               ──► re-arm EPOLLOUT
+           │
+           └─ EPOLLOUT ──► response::writer::write_nonblocking()
+                          ──► if done: check Connection header → close or keep-alive
+
+Cargo.toml Dependencies
+toml[dependencies]
+libc = "0.2"          # epoll, fork, socketpairs, syscalls
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["blocking"] }   # integration tests
+Everything else — HTTP parsing, event loop, CGI, sessions — is written from scratch. No tokio, hyper, actix, or nix.
+
+What's Next
+When you're ready to start coding, a good build order is:
+
+config/ — parse and validate a config file
+event_loop/epoll.rs + server/listener.rs — accept connections
+http/request/parser.rs — parse raw bytes into Request
+router/ + handlers/static_file.rs — serve a GET request end-to-end
+http/response/writer.rs — non-blocking writes
+server/connection.rs state machine + server/timeout.rs
+handlers/upload.rs, handlers/delete.rs
+cgi/ module
+session/ + session/cookie.rs
+Stress tests with siege
