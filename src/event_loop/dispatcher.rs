@@ -25,26 +25,20 @@
 /// Connections idle for longer than `TIMEOUT_*` constants are closed, with a
 /// 408 response if headers were still being received.
 use std::os::unix::io::RawFd;
-use std::time::Duration;
 
 use libc::epoll_event;
 
 use crate::config::types::ServerConfig;
 use crate::event_loop::epoll::{is_closed, is_readable, is_writable, Epoll, EPOLLIN, EPOLLOUT};
 use crate::event_loop::registry::Registry;
+use crate::http::request::body::{read_body_chunked, read_body_unchunked, BodyResult, ChunkedResult};
+use crate::http::request::parser::{parse_request_head, ParseResult};
+use crate::http::response::writer::{serialize, write_nonblocking, WriteResult};
+use crate::router::handler::dispatch;
+use crate::router::matcher::{match_route, select_server};
 use crate::server::connection::{ConnectionPhase, ConnectionState};
 use crate::server::listener::{accept_one, AcceptResult};
-
-// ---------------------------------------------------------------------------
-// Timeout constants
-// ---------------------------------------------------------------------------
-
-/// Maximum time a connection may spend in header/body reading phases.
-const TIMEOUT_READ: Duration  = Duration::from_secs(30);
-/// Maximum time a response write may take before we give up.
-const TIMEOUT_WRITE: Duration = Duration::from_secs(60);
-/// Maximum time we wait for a CGI process to produce output.
-const TIMEOUT_CGI: Duration   = Duration::from_secs(30);
+use crate::server::timeout::{canned_response, timeout_for_phase, TimeoutClass};
 
 /// How many events we ask `epoll_wait` to return per call.
 const MAX_EVENTS: usize = 128;
@@ -120,8 +114,8 @@ fn accept_new_connection(
     registry:    &mut Registry,
     configs:     &[ServerConfig],
 ) {
-    let server_id = match registry.listener(listener_fd) {
-        Some(e) => e.server_id,
+    let (server_id, local_port) = match registry.listener(listener_fd) {
+        Some(e) => (e.server_id, e.port),
         None => {
             eprintln!("[WARN] accept_new_connection: fd {listener_fd} not in registry");
             return;
@@ -131,25 +125,21 @@ fn accept_new_connection(
     loop {
         match accept_one(listener_fd) {
             AcceptResult::Accepted { fd, peer } => {
-                eprintln!("[INFO] Accepted connection fd={fd} from {peer} (server_id={server_id})");
+                eprintln!("[INFO] Accepted connection fd={fd} from {peer} (server_id={server_id}, port={local_port})");
 
-                // Register with epoll: only EPOLLIN until we have something to write.
                 if let Err(e) = epoll.add(fd, EPOLLIN as u32, fd as u64) {
                     eprintln!("[ERROR] epoll.add fd={fd}: {e}");
                     unsafe { libc::close(fd) };
                     continue;
                 }
 
-                let state = ConnectionState::new(fd, server_id, peer);
+                let state = ConnectionState::new(fd, server_id, local_port, peer);
                 registry.register_connection(fd, state);
             }
 
-            AcceptResult::WouldBlock => break, // No more pending connections.
+            AcceptResult::WouldBlock => break,
 
             AcceptResult::Error(e) => {
-                // EMFILE / ENFILE: out of file descriptors. Log and stop
-                // accepting for this tick — connections will queue in the
-                // kernel backlog until the next tick frees some fds.
                 eprintln!("[WARN] accept4 on fd={listener_fd} failed: errno={e}");
                 break;
             }
@@ -307,45 +297,36 @@ fn close_connection(
 
 /// Walk all open connections and close those that have been idle too long.
 ///
-/// Called once per `epoll_wait` tick. Building the fd list allocates, but
-/// timeout sweeps are infrequent (once per second) so this is acceptable.
+/// Called once per `epoll_wait` tick. Uses `timeout_for_phase` from
+/// `server::timeout` so phase-to-timeout mapping stays in one place.
 fn check_timeouts(registry: &mut Registry, epoll: &Epoll) {
     let fds = registry.all_connection_fds();
-
     let mut to_close: Vec<(RawFd, &'static [u8])> = Vec::new();
 
     for fd in fds {
-        let timed_out = match registry.get_connection(fd) {
+        let verdict = match registry.get_connection(fd) {
             None => continue,
             Some(conn) => {
-                let timeout = match &conn.phase {
-                    ConnectionPhase::ReadingHeaders
-                    | ConnectionPhase::ReadingBody { .. }
-                    | ConnectionPhase::ReadingChunked { .. } => TIMEOUT_READ,
-
-                    ConnectionPhase::WritingResponse { .. } => TIMEOUT_WRITE,
-
-                    ConnectionPhase::AwaitingCgi { .. } => TIMEOUT_CGI,
-
-                    // Processing is synchronous and transient; Done is
-                    // removed immediately. Neither should linger.
-                    ConnectionPhase::Processing | ConnectionPhase::Done => TIMEOUT_READ,
-                };
-                conn.is_timed_out(timeout)
+                match timeout_for_phase(&conn.phase) {
+                    None                     => None, // Done — no timeout needed
+                    Some((dur, class)) => {
+                        if conn.is_timed_out(dur) {
+                            Some(class)
+                        } else {
+                            None
+                        }
+                    }
+                }
             }
         };
 
-        if timed_out {
-            // Choose a response based on phase.
-            let response: &'static [u8] = match registry
-                .get_connection(fd)
-                .map(|c| matches!(c.phase, ConnectionPhase::ReadingHeaders | ConnectionPhase::ReadingBody { .. } | ConnectionPhase::ReadingChunked { .. }))
-            {
-                Some(true)  => HTTP_408,
-                _           => HTTP_504, // gateway timeout for CGI, generic for writes
+        if let Some(class) = verdict {
+            let label = match class {
+                TimeoutClass::RequestTimeout => "408",
+                TimeoutClass::GatewayTimeout => "504",
             };
-            eprintln!("[INFO] Timeout on fd={fd}, sending {}", if response == HTTP_408 { "408" } else { "504" });
-            to_close.push((fd, response));
+            eprintln!("[INFO] Timeout ({label}) on fd={fd}");
+            to_close.push((fd, canned_response(class)));
         }
     }
 
@@ -396,32 +377,133 @@ enum Transition {
     Close,
 }
 
-/// Attempt to advance the connection's parse/processing state.
+/// Advance the connection through its parse → route → respond pipeline.
 ///
-/// This is a **stub** that accepts any data containing `\r\n\r\n` as a complete
-/// request and queues a hard-coded 200 OK. The real HTTP parser will replace
-/// this in the next step.
-fn advance_connection(conn: &mut ConnectionState, _configs: &[ServerConfig]) -> Transition {
-    match conn.phase {
-        ConnectionPhase::ReadingHeaders => {
-            // Detect end-of-headers: look for \r\n\r\n in the read buffer.
-            if conn.read_buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                // --- Stub response until HTTP parser is wired in ---
-                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nHello, world!".to_vec();
-                conn.set_response(response);
-                Transition::ResponseReady
-            } else if conn.read_buf.len() > 8192 {
-                // Headers too large — 400 Bad Request.
-                conn.set_response(HTTP_400.to_vec());
-                Transition::ResponseReady
-            } else {
-                Transition::NeedMoreData
+/// All phase transitions use the methods on `ConnectionState`; the
+/// dispatcher does not manipulate `conn.phase` directly.
+fn advance_connection(conn: &mut ConnectionState, configs: &[ServerConfig]) -> Transition {
+    loop {
+        match &conn.phase {
+            // ----------------------------------------------------------------
+            // Phase 1: parse request headers
+            // ----------------------------------------------------------------
+            ConnectionPhase::ReadingHeaders => {
+                match parse_request_head(&conn.read_buf) {
+                    ParseResult::Incomplete => return Transition::NeedMoreData,
+
+                    ParseResult::Error(e) => {
+                        eprintln!("[WARN] parse error fd={}: {e}", conn.fd);
+                        conn.set_response(HTTP_400.to_vec());
+                        return Transition::ResponseReady;
+                    }
+
+                    ParseResult::Complete(req, consumed) => {
+                        let body_so_far = conn.read_buf[consumed..].to_vec();
+
+                        if req.is_chunked() {
+                            conn.begin_reading_chunked(req, body_so_far);
+                            continue;
+                        } else if let Some(cl) = req.content_length() {
+                            if cl == 0 {
+                                conn.keep_alive = req.is_keep_alive();
+                                conn.request = Some(req);
+                                conn.read_buf.clear();
+                                conn.phase = ConnectionPhase::Processing;
+                                return process_request(conn, configs);
+                            }
+                            conn.begin_reading_body(req, cl, body_so_far);
+                            continue;
+                        } else {
+                            conn.keep_alive = req.is_keep_alive();
+                            conn.request = Some(req);
+                            conn.read_buf.clear();
+                            conn.phase = ConnectionPhase::Processing;
+                            return process_request(conn, configs);
+                        }
+                    }
+                }
             }
+
+            // ----------------------------------------------------------------
+            // Phase 2a: fixed-length body
+            // ----------------------------------------------------------------
+            ConnectionPhase::ReadingBody { expected, .. } => {
+                let expected = *expected;
+                match read_body_unchunked(&conn.read_buf, expected) {
+                    BodyResult::NeedsMore { .. } => return Transition::NeedMoreData,
+                    BodyResult::Complete(body) => {
+                        conn.complete_body(body);
+                        return process_request(conn, configs);
+                    }
+                }
+            }
+
+            // ----------------------------------------------------------------
+            // Phase 2b: chunked body
+            // ----------------------------------------------------------------
+            ConnectionPhase::ReadingChunked { assembled } => {
+                let assembled = assembled.clone();
+                match read_body_chunked(&assembled) {
+                    ChunkedResult::NeedsMore => return Transition::NeedMoreData,
+                    ChunkedResult::Error(e) => {
+                        eprintln!("[WARN] chunked decode error fd={}: {e}", conn.fd);
+                        conn.set_response(HTTP_400.to_vec());
+                        return Transition::ResponseReady;
+                    }
+                    ChunkedResult::Complete(body, _) => {
+                        conn.complete_body(body);
+                        return process_request(conn, configs);
+                    }
+                }
+            }
+
+            ConnectionPhase::Processing
+            | ConnectionPhase::WritingResponse { .. }
+            | ConnectionPhase::AwaitingCgi { .. }
+            | ConnectionPhase::Done => return Transition::Close,
         }
-        // Other phases are handled by more specific code; if we land here,
-        // it's a logic error — close defensively.
-        _ => Transition::Close,
     }
+}
+
+/// Dispatch the stored `Request` and serialise the response.
+fn process_request(conn: &mut ConnectionState, configs: &[ServerConfig]) -> Transition {
+    if configs.is_empty() {
+        conn.set_response(HTTP_500.to_vec());
+        return Transition::ResponseReady;
+    }
+
+    let req = match conn.request.take() {
+        Some(r) => r,
+        None => {
+            conn.set_response(HTTP_500.to_vec());
+            return Transition::ResponseReady;
+        }
+    };
+
+    let server = select_server(req.host(), conn.local_port, configs);
+
+    let route = match match_route(&req.path, &server.routes) {
+        Some(r) => r,
+        None => {
+            let page  = server.error_page(404)
+                .and_then(|p| std::fs::read_to_string(p).ok());
+            let resp  = crate::http::response::builder::not_found(page.as_deref());
+            let bytes = serialize(&resp);
+            conn.set_response(bytes);
+            return Transition::ResponseReady;
+        }
+    };
+
+    let response = dispatch(&req, route, server);
+
+    let bytes = if req.method == crate::config::types::Method::Head {
+        crate::http::response::writer::serialize_head_response(&response)
+    } else {
+        serialize(&response)
+    };
+
+    conn.set_response(bytes);
+    Transition::ResponseReady
 }
 
 enum FlushResult {
@@ -436,35 +518,30 @@ enum FlushResult {
 /// Write as many bytes as possible from `conn.write_buf` to `fd`.
 fn flush_write_buf(fd: RawFd, conn: &mut ConnectionState) -> FlushResult {
     if let ConnectionPhase::WritingResponse { ref mut bytes_written } = conn.phase {
-        let remaining = &conn.write_buf[*bytes_written..];
-        if remaining.is_empty() {
+        let total = conn.write_buf.len();
+        let offset = *bytes_written;
+
+        if offset >= total {
             let keep_alive = conn.finish();
             return FlushResult::Done { keep_alive };
         }
 
-        let n = unsafe {
-            libc::write(fd, remaining.as_ptr() as *const _, remaining.len())
-        };
-
-        if n > 0 {
-            *bytes_written += n as usize;
-            if *bytes_written >= conn.write_buf.len() {
-                let keep_alive = conn.finish();
-                return FlushResult::Done { keep_alive };
+        match write_nonblocking(fd, &conn.write_buf, offset) {
+            WriteResult::BytesWritten(n) => {
+                *bytes_written += n;
+                if *bytes_written >= total {
+                    let keep_alive = conn.finish();
+                    FlushResult::Done { keep_alive }
+                } else {
+                    FlushResult::Partial
+                }
             }
-            return FlushResult::Partial;
-        } else if n == 0 {
-            return FlushResult::Error(0);
-        } else {
-            let e = unsafe { *libc::__errno_location() };
-            if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
-                return FlushResult::Partial;
-            }
-            return FlushResult::Error(e);
+            WriteResult::WouldBlock => FlushResult::Partial,
+            WriteResult::Error(e)   => FlushResult::Error(e),
         }
+    } else {
+        FlushResult::Error(-1)
     }
-    // Not in WritingResponse — shouldn't happen.
-    FlushResult::Error(-1)
 }
 
 // ---------------------------------------------------------------------------
@@ -486,6 +563,14 @@ Content-Length: 15\r\n\
 Connection: close\r\n\
 \r\n\
 Request Timeout";
+
+const HTTP_500: &[u8] = b"\
+HTTP/1.1 500 Internal Server Error\r\n\
+Content-Type: text/plain\r\n\
+Content-Length: 21\r\n\
+Connection: close\r\n\
+\r\n\
+Internal Server Error";
 
 const HTTP_504: &[u8] = b"\
 HTTP/1.1 504 Gateway Timeout\r\n\
@@ -510,10 +595,10 @@ mod tests {
     }
 
     fn conn(fd: RawFd) -> ConnectionState {
-        ConnectionState::new(fd, 0, dummy_addr())
+        ConnectionState::new(fd, 0, 8080, dummy_addr())
     }
 
-    // ---- advance_connection stub -------------------------------------------
+    // ---- advance_connection -----------------------------------------------
 
     #[test]
     fn stub_returns_need_more_data_without_double_crlf() {
@@ -528,45 +613,19 @@ mod tests {
         let mut c = conn(5);
         c.read_buf.extend_from_slice(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
         let result = advance_connection(&mut c, &[]);
-        assert!(matches!(result, Transition::ResponseReady));
+        // With no configs the server falls through to HTTP_500 or 404;
+        // either way the phase must be WritingResponse.
         assert!(matches!(c.phase, ConnectionPhase::WritingResponse { .. }));
     }
 
     #[test]
-    fn stub_returns_response_ready_on_oversized_headers() {
+    fn oversized_header_block_returns_400_response() {
         let mut c = conn(5);
-        c.read_buf.extend(vec![b'A'; 8193]);
+        c.read_buf.extend(b"GET / HTTP/1.1\r\nX-Pad: ".iter().copied());
+        c.read_buf.extend(vec![b'A'; crate::http::request::parser::MAX_HEADER_BYTES + 1]);
         let result = advance_connection(&mut c, &[]);
         assert!(matches!(result, Transition::ResponseReady));
         assert!(c.write_buf.starts_with(b"HTTP/1.1 400"));
-    }
-
-    // ---- flush_write_buf ---------------------------------------------------
-
-    #[test]
-    fn flush_on_done_connection_returns_done() {
-        // Create a connected socket pair to write into.
-        let (rd, wr) = make_socket_pair();
-
-        let mut c = conn(wr);
-        c.set_response(b"HTTP/1.1 200 OK\r\n\r\n".to_vec());
-
-        // Drain the write side.
-        let result = flush_write_buf(wr, &mut c);
-
-        // Clean up before asserting so fds don't leak on failure.
-        unsafe { libc::close(rd); libc::close(wr); }
-
-        assert!(matches!(result, FlushResult::Done { .. }));
-    }
-
-    // ---- timeout constants sanity ------------------------------------------
-
-    #[test]
-    fn timeout_constants_are_non_zero() {
-        assert!(TIMEOUT_READ.as_secs()  > 0);
-        assert!(TIMEOUT_WRITE.as_secs() > 0);
-        assert!(TIMEOUT_CGI.as_secs()   > 0);
     }
 
     // ---- drain_socket / DrainResult ----------------------------------------

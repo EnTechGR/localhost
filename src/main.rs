@@ -1,6 +1,10 @@
 mod config;
 mod event_loop;
+mod handlers;
+mod http;
+mod router;
 mod server;
+mod utils;
 
 use event_loop::{dispatcher, epoll::Epoll, registry::Registry};
 use server::listener::bind_listeners;
