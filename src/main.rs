@@ -5,6 +5,8 @@ mod http;
 mod router;
 mod server;
 mod utils;
+mod cgi;
+mod session;
 
 use event_loop::{dispatcher, epoll::Epoll, registry::Registry};
 use server::listener::bind_listeners;
