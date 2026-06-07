@@ -1,0 +1,11 @@
+{
+  "version": "0.2",
+  "language": "en-GB",
+  "words": [
+    "epoll", "EPOLLIN", "EPOLLOUT", "EPOLLERR", "EPOLLHUP", "EPOLLRDHUP",
+    "errno", "EINTR", "EAGAIN", "EWOULDBLOCK", "ENOENT", "ECHILD",
+    "waitpid", "WNOHANG", "fcntl", "GETFL", "SETFL", "NONBLOCK",
+    "socketpair", "eflags", "unchunked", "nonblocking", "serialise", "libc", "conn", "resp", "redir",
+    "rsplit", "EPOLLET", "CLOEXEC", "writable", "interp", "getpid", "toolong",
+  ]
+}

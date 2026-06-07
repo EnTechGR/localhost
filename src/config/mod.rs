@@ -12,6 +12,12 @@ pub mod parser;
 pub mod types;
 pub mod validator;
 
+// Curated public facade for the config module. `ConfigError` and `ServerConfig`
+// are consumed by `load` below; the remaining names are part of the intended
+// public surface and are referenced through `config::` as more of the server
+// is wired up. In a binary crate an unconsumed `pub use` reads as dead, so we
+// allow it here rather than drop the facade.
+#[allow(unused_imports)]
 pub use types::{ConfigError, Method, Redirect, RouteConfig, ServerConfig};
 
 /// Convenience function: parse the file at `path` and validate all configs.

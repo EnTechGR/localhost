@@ -65,7 +65,16 @@ pub fn run(epoll: Epoll, mut registry: Registry, configs: Vec<ServerConfig>) -> 
     let mut events: Vec<epoll_event> =
         vec![unsafe { std::mem::zeroed() }; MAX_EVENTS];
 
-    eprintln!("[INFO] Event loop started, waiting for connections");
+    eprintln!(
+        "[INFO] Event loop started: {} listener(s) registered",
+        registry.listener_count()
+    );
+    for (fd, entry) in registry.listeners() {
+        eprintln!(
+            "[INFO]   listener fd={fd} (server_id={}, port={})",
+            entry.server_id, entry.port
+        );
+    }
 
     loop {
         let n = match epoll.wait(&mut events, EPOLL_TIMEOUT_MS) {
@@ -87,7 +96,7 @@ pub fn run(epoll: Epoll, mut registry: Registry, configs: Vec<ServerConfig>) -> 
 
             if registry.is_listener(fd) {
                 // Listener socket ready: accept as many connections as possible.
-                accept_new_connection(fd, &epoll, &mut registry, &configs);
+                accept_new_connection(fd, &epoll, &mut registry);
             } else if is_closed(eflags) {
                 // Remote end closed or an error occurred.
                 close_connection(fd, &epoll, &mut registry, None);
@@ -98,7 +107,6 @@ pub fn run(epoll: Epoll, mut registry: Registry, configs: Vec<ServerConfig>) -> 
             }
         }
 
-        // Periodic timeout sweep — runs once per epoll_wait tick.
         // Periodic timeout sweep — runs once per epoll_wait tick.
         check_timeouts(&mut registry, &epoll);
         reap_children();
@@ -118,7 +126,6 @@ fn accept_new_connection(
     listener_fd: RawFd,
     epoll:       &Epoll,
     registry:    &mut Registry,
-    configs:     &[ServerConfig],
 ) {
     let (server_id, local_port) = match registry.listener(listener_fd) {
         Some(e) => (e.server_id, e.port),
@@ -360,13 +367,11 @@ enum DrainResult {
 /// Read from `fd` into `buf` until `EAGAIN`.
 fn drain_socket(fd: RawFd, buf: &mut Vec<u8>) -> DrainResult {
     let mut tmp = [0u8; 8192];
-    let mut got_data = false;
 
     loop {
         let n = unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut _, tmp.len()) };
         if n > 0 {
             buf.extend_from_slice(&tmp[..n as usize]);
-            got_data = true;
             // Keep reading — there may be more.
         } else if n == 0 {
             return DrainResult::Closed;
@@ -572,14 +577,6 @@ Connection: close\r\n\
 \r\n\
 Bad Request";
 
-const HTTP_408: &[u8] = b"\
-HTTP/1.1 408 Request Timeout\r\n\
-Content-Type: text/plain\r\n\
-Content-Length: 15\r\n\
-Connection: close\r\n\
-\r\n\
-Request Timeout";
-
 const HTTP_500: &[u8] = b"\
 HTTP/1.1 500 Internal Server Error\r\n\
 Content-Type: text/plain\r\n\
@@ -587,14 +584,6 @@ Content-Length: 21\r\n\
 Connection: close\r\n\
 \r\n\
 Internal Server Error";
-
-const HTTP_504: &[u8] = b"\
-HTTP/1.1 504 Gateway Timeout\r\n\
-Content-Type: text/plain\r\n\
-Content-Length: 15\r\n\
-Connection: close\r\n\
-\r\n\
-Gateway Timeout";
 
 /// Reap all finished child processes (CGI) to prevent zombies.
 ///
@@ -645,7 +634,8 @@ mod tests {
         c.read_buf.extend_from_slice(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
         let result = advance_connection(&mut c, &[]);
         // With no configs the server falls through to HTTP_500 or 404;
-        // either way the phase must be WritingResponse.
+        // either way the response is ready and the phase is WritingResponse.
+        assert!(matches!(result, Transition::ResponseReady));
         assert!(matches!(c.phase, ConnectionPhase::WritingResponse { .. }));
     }
 

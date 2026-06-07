@@ -191,15 +191,6 @@ impl ServerConfig {
         self.error_pages.get(&code).map(String::as_str)
     }
 
-    /// Find the best-matching route for the given URL path using longest
-    /// prefix matching. Always returns a route (falls back to `/`).
-    pub fn match_route(&self, url_path: &str) -> Option<&RouteConfig> {
-        self.routes
-            .iter()
-            .filter(|r| url_path.starts_with(r.path.as_str()))
-            .max_by_key(|r| r.path.len())
-    }
-
     /// Effective client body limit: the server-level default, since per-route
     /// overrides are checked separately in the handler.
     pub fn body_limit(&self) -> usize {
@@ -244,6 +235,10 @@ pub enum ConfigError {
 
     /// A port number was outside the valid range 1–65535.
     InvalidPort(u32),
+
+    /// A "set-once" directive (e.g. `host`, `root`, `redirect`) appeared more
+    /// than once within a single block, making its value ambiguous.
+    DuplicateDirective { directive: &'static str, first_line: usize, line: usize },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -267,6 +262,8 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "route root '{path}' is not a valid directory"),
             ConfigError::InvalidPort(p) =>
                 write!(f, "port {p} is out of valid range 1–65535"),
+            ConfigError::DuplicateDirective { directive, first_line, line } =>
+                write!(f, "directive '{directive}' is set more than once (line {line}; first seen at line {first_line})"),
         }
     }
 }
@@ -339,29 +336,6 @@ mod tests {
         };
         // index_file wins over default_file
         assert_eq!(route.effective_index(), "start.html");
-    }
-
-    #[test]
-    fn server_match_route_longest_prefix() {
-        let mut server = ServerConfig::default();
-        server.routes = vec![
-            RouteConfig { path: "/".into(),        ..Default::default() },
-            RouteConfig { path: "/static".into(),  ..Default::default() },
-            RouteConfig { path: "/static/img".into(), ..Default::default() },
-        ];
-
-        assert_eq!(
-            server.match_route("/static/img/logo.png").map(|r| r.path.as_str()),
-            Some("/static/img")
-        );
-        assert_eq!(
-            server.match_route("/static/css/app.css").map(|r| r.path.as_str()),
-            Some("/static")
-        );
-        assert_eq!(
-            server.match_route("/index.html").map(|r| r.path.as_str()),
-            Some("/")
-        );
     }
 
     #[test]

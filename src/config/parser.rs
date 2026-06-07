@@ -313,6 +313,8 @@ fn parse_route_block(
         ..Default::default()
     };
 
+    let mut seen: HashMap<&'static str, usize> = HashMap::new();
+
     loop {
         let token = match stream.peek() {
             None => {
@@ -344,28 +346,34 @@ fn parse_route_block(
             }
 
             "root" => {
+                mark_once(&mut seen, "root", directive.line)?;
                 let val = stream.expect_word("root path")?;
                 cfg.root = Some(val.value.clone());
             }
-
             "index" | "default_file" => {
+                mark_once(&mut seen, "index", directive.line)?;
                 let val = stream.expect_word("index file")?;
                 cfg.index_file = Some(val.value.clone());
             }
-
             "directory_listing" => {
+                mark_once(&mut seen, "directory_listing", directive.line)?;
                 let val = stream.expect_word("directory_listing value")?;
                 cfg.directory_listing = parse_bool(&val.value, val.line)?;
             }
-
             "redirect" => {
-                let code_tok = stream.expect_word("redirect status code")?;
+                mark_once(&mut seen, "redirect", directive.line)?;
+                let code_tok   = stream.expect_word("redirect status code")?;
                 let target_tok = stream.expect_word("redirect target URL")?;
                 let code = parse_redirect_code(&code_tok.value, code_tok.line)?;
                 cfg.redirect = Some(Redirect {
                     code,
                     target: target_tok.value.clone(),
                 });
+            }
+            "client_body_limit" => {
+                mark_once(&mut seen, "client_body_limit", directive.line)?;
+                let val = stream.expect_word("client_body_limit value")?;
+                cfg.client_body_limit = Some(parse_size(&val.value, val.line)?);
             }
 
             "cgi" => {
@@ -374,11 +382,6 @@ fn parse_route_block(
                 let interp_tok = stream.expect_word("cgi interpreter path")?;
                 let ext = ext_tok.value.trim_start_matches('.').to_lowercase();
                 cfg.cgi_extensions.insert(ext, interp_tok.value.clone());
-            }
-
-            "client_body_limit" => {
-                let val = stream.expect_word("client_body_limit value")?;
-                cfg.client_body_limit = Some(parse_size(&val.value, val.line)?);
             }
 
             other => {
@@ -479,6 +482,18 @@ fn parse_size(s: &str, line: usize) -> Result<usize, ConfigError> {
             detail: format!("invalid size '{s}'"),
             line,
         })
+}
+
+/// Record a "set-once" directive, erroring if already seen in this block.
+fn mark_once(
+    seen: &mut HashMap<&'static str, usize>,
+    key:  &'static str,
+    line: usize,
+) -> Result<(), ConfigError> {
+    match seen.insert(key, line) {
+        Some(first_line) => Err(ConfigError::DuplicateDirective { directive: key, first_line, line }),
+        None => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -710,5 +725,33 @@ server {
     fn invalid_port_too_large_is_error() {
         let src = "server { host 0.0.0.0  port 99999  route / { root /w } }";
         assert!(parse_source(src).is_err());
+    }
+    #[test]
+    fn duplicate_root_in_route_is_rejected() {
+        let src = "server { host 0.0.0.0 port 80 route / { root /a  root /b } }";
+        assert!(matches!(parse_source(src).unwrap_err(),
+            ConfigError::DuplicateDirective { directive: "root", .. }));
+    }
+
+    #[test]
+    fn index_and_default_file_conflict() {
+        let src = "server { host 0.0.0.0 port 80 route / { index a.html  default_file b.html } }";
+        assert!(matches!(parse_source(src).unwrap_err(),
+            ConfigError::DuplicateDirective { directive: "index", .. }));
+    }
+
+    #[test]
+    fn duplicate_host_in_server_is_rejected() {
+        let src = "server { host 0.0.0.0  host 127.0.0.1  port 80  route / { root /a } }";
+        assert!(matches!(parse_source(src).unwrap_err(),
+            ConfigError::DuplicateDirective { directive: "host", .. }));
+    }
+
+    #[test]
+    fn repeated_methods_still_accumulate() {
+        let src = "server { host 0.0.0.0 port 80 route / { methods GET  methods POST  root /a } }";
+        let s = parse_source(src).unwrap();
+        let m = &s[0].routes[0].methods;
+        assert!(m.contains(&Method::Get) && m.contains(&Method::Post));
     }
 }

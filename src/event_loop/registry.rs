@@ -88,7 +88,9 @@ impl Registry {
         self.listeners.iter().map(|(&fd, e)| (fd, e))
     }
 
-    /// Remove a listener entry (called when a listener is shut down).
+    /// Remove a listener entry. Symmetric counterpart to `register_listener`,
+    /// reserved for a graceful-shutdown path that is not yet wired.
+    #[allow(dead_code)]
     pub fn remove_listener(&mut self, fd: RawFd) {
         self.listeners.remove(&fd);
     }
@@ -170,7 +172,7 @@ mod tests {
     }
 
     fn conn(fd: RawFd) -> ConnectionState {
-        ConnectionState::new(fd, 0, addr(9000))
+        ConnectionState::new(fd, 0, 9000, addr(9000))
     }
 
     // ---- listeners ---------------------------------------------------------

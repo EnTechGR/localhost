@@ -3,7 +3,6 @@
 /// `Response` is the owned representation produced by `builder.rs` and
 /// consumed by `writer.rs`. The `HeaderMap` here is write-oriented:
 /// insertion order is preserved for deterministic wire output.
-use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // StatusCode

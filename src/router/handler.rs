@@ -53,7 +53,7 @@ pub fn dispatch(
     // 4. Body size limit
     // ------------------------------------------------------------------
     let limit = route.client_body_limit
-        .unwrap_or(server.client_body_limit);
+        .unwrap_or(server.body_limit());
     if request.body.len() > limit {
         return builder::payload_too_large();
     }

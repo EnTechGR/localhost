@@ -153,7 +153,10 @@ impl Epoll {
         }
     }
 
-    /// Return the raw epoll file descriptor (needed for CGI pipe registration).
+    /// Return the raw epoll file descriptor. Not used by the currently wired
+    /// code — pipe/connection registration goes through `add`/`modify`/`delete`
+    /// — but kept as the idiomatic low-level accessor on the wrapper.
+    #[allow(dead_code)]
     pub fn raw_fd(&self) -> RawFd {
         self.fd
     }
