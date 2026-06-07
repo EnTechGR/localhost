@@ -68,6 +68,7 @@ pub fn serialize(response: &Response) -> Vec<u8> {
     }
 
     // Inject standard headers not already set by the builder.
+    // Inject standard headers not already set by the builder.
     if response.headers.get("Date").is_none() {
         buf.extend_from_slice(b"Date: ");
         buf.extend_from_slice(rfc7231_date().as_bytes());
@@ -76,6 +77,12 @@ pub fn serialize(response: &Response) -> Vec<u8> {
     if response.headers.get("Server").is_none() {
         buf.extend_from_slice(b"Server: localhost/0.1\r\n");
     }
+    if response.headers.get("Connection").is_none() {
+        buf.extend_from_slice(b"Connection: keep-alive\r\n");
+    }
+
+    // Header / body separator.
+    buf.extend_from_slice(b"\r\n");
 
     // Header / body separator.
     buf.extend_from_slice(b"\r\n");

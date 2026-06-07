@@ -47,6 +47,10 @@ const MAX_EVENTS: usize = 128;
 /// frequently without burning CPU on an idle server.
 const EPOLL_TIMEOUT_MS: i32 = 1_000; // 1 second
 
+/// Soft cap on simultaneous connections. Prevents fd exhaustion under siege.
+/// The OS default ulimit is typically 1024; we stay well under that.
+const MAX_CONNECTIONS: usize = 512;
+
 // ---------------------------------------------------------------------------
 // run()
 // ---------------------------------------------------------------------------
@@ -95,7 +99,9 @@ pub fn run(epoll: Epoll, mut registry: Registry, configs: Vec<ServerConfig>) -> 
         }
 
         // Periodic timeout sweep — runs once per epoll_wait tick.
+        // Periodic timeout sweep — runs once per epoll_wait tick.
         check_timeouts(&mut registry, &epoll);
+        reap_children();
     }
 }
 
@@ -123,6 +129,10 @@ fn accept_new_connection(
     };
 
     loop {
+        // Back-pressure: stop accepting when near fd limit.
+        if registry.connection_count() >= MAX_CONNECTIONS {
+            break;
+        }
         match accept_one(listener_fd) {
             AcceptResult::Accepted { fd, peer } => {
                 eprintln!("[INFO] Accepted connection fd={fd} from {peer} (server_id={server_id}, port={local_port})");
@@ -189,8 +199,7 @@ fn read_from_connection(
         return;
     }
 
-    // Attempt to advance the connection's parse state.
-    // For this step we produce a stub 200 OK until the HTTP parser is wired in.
+    // Advance the connection through parse → route → respond.
     let transition = match registry.get_connection_mut(fd) {
         None => return,
         Some(conn) => advance_connection(conn, configs),
@@ -487,14 +496,21 @@ fn process_request(conn: &mut ConnectionState, configs: &[ServerConfig]) -> Tran
         None => {
             let page  = server.error_page(404)
                 .and_then(|p| std::fs::read_to_string(p).ok());
-            let resp  = crate::http::response::builder::not_found(page.as_deref());
+            let mut resp = crate::http::response::builder::not_found(page.as_deref());
+            if !conn.keep_alive {
+                resp.headers.set("Connection", "close");
+            }
             let bytes = serialize(&resp);
             conn.set_response(bytes);
             return Transition::ResponseReady;
         }
     };
 
-    let response = dispatch(&req, route, server);
+    let mut response = dispatch(&req, route, server);
+
+    if !conn.keep_alive {
+        response.headers.set("Connection", "close");
+    }
 
     let bytes = if req.method == crate::config::types::Method::Head {
         crate::http::response::writer::serialize_head_response(&response)
@@ -579,6 +595,21 @@ Content-Length: 15\r\n\
 Connection: close\r\n\
 \r\n\
 Gateway Timeout";
+
+/// Reap all finished child processes (CGI) to prevent zombies.
+///
+/// Called once per event-loop tick. Returns immediately when no children
+/// exist (`ECHILD`) or none have exited yet (`WNOHANG` returns 0).
+fn reap_children() {
+    loop {
+        let mut status: libc::c_int = 0;
+        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if pid <= 0 {
+            break;
+        }
+        eprintln!("[INFO] Reaped child pid={pid} status={status}");
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests
