@@ -31,6 +31,8 @@ use std::os::unix::io::RawFd;
 use std::time::Instant;
 
 use crate::http::request::types::Request;
+use crate::cgi::CgiProcess;
+
 
 // ---------------------------------------------------------------------------
 // ConnectionPhase
@@ -117,7 +119,14 @@ pub struct ConnectionState {
     /// Whether the client negotiated keep-alive.
     /// Set from `Request::is_keep_alive()` as soon as headers are parsed.
     pub keep_alive: bool,
+
+    /// Live CGI child + pipe state while `phase == AwaitingCgi`. `None`
+    /// otherwise. Kept separate from `ConnectionPhase::AwaitingCgi` (which
+    /// only carries `child_pid`/`pipe_fd` for Debug/timeout purposes) so the
+    /// non-blocking I/O helpers in `cgi::io` can operate on it directly.
+    pub cgi: Option<CgiProcess>,
 }
+
 
 impl ConnectionState {
     /// Create a new connection in `ReadingHeaders`.
@@ -133,6 +142,7 @@ impl ConnectionState {
             last_activity: Instant::now(),
             peer_addr,
             keep_alive:    false,
+            cgi:           None,
         }
     }
 
@@ -210,6 +220,7 @@ impl ConnectionState {
             self.read_buf.clear();
             self.write_buf.clear();
             self.request = None;
+            self.cgi     = None;
             self.phase   = ConnectionPhase::ReadingHeaders;
             self.touch();
             true

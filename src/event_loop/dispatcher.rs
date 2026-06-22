@@ -39,6 +39,8 @@ use crate::router::matcher::{match_route, select_server};
 use crate::server::connection::{ConnectionPhase, ConnectionState};
 use crate::server::listener::{accept_one, AcceptResult};
 use crate::server::timeout::{canned_response, timeout_for_phase, TimeoutClass};
+use crate::cgi::{self, io::{StdinOutcome, StdoutOutcome}};
+use crate::router::handler::DispatchOutcome;
 
 /// How many events we ask `epoll_wait` to return per call.
 const MAX_EVENTS: usize = 128;
@@ -95,10 +97,10 @@ pub fn run(epoll: Epoll, mut registry: Registry, configs: Vec<ServerConfig>) -> 
             let eflags = event.events;
 
             if registry.is_listener(fd) {
-                // Listener socket ready: accept as many connections as possible.
                 accept_new_connection(fd, &epoll, &mut registry);
+            } else if registry.is_cgi_fd(fd) {
+                handle_cgi_event(fd, eflags, &epoll, &mut registry);
             } else if is_closed(eflags) {
-                // Remote end closed or an error occurred.
                 close_connection(fd, &epoll, &mut registry, None);
             } else if is_readable(eflags) {
                 read_from_connection(fd, &epoll, &mut registry, &configs);
@@ -218,7 +220,6 @@ fn read_from_connection(
         }
 
         Transition::ResponseReady => {
-            // Arm EPOLLOUT so we are notified when the socket can be written.
             if let Err(e) = epoll.modify(fd, EPOLLOUT as u32, fd as u64) {
                 eprintln!("[ERROR] epoll.modify EPOLLOUT fd={fd}: {e}");
                 close_connection(fd, epoll, registry, None);
@@ -228,6 +229,182 @@ fn read_from_connection(
         Transition::Close => {
             close_connection(fd, epoll, registry, None);
         }
+
+        Transition::CgiStarted { stdout_fd, stdin_fd } => {
+            if let Err(e) = epoll.add(stdout_fd, EPOLLIN as u32, stdout_fd as u64) {
+                eprintln!("[ERROR] epoll.add cgi stdout fd={stdout_fd}: {e}");
+                close_connection(fd, epoll, registry, None);
+                return;
+            }
+            registry.register_cgi_fd(stdout_fd, fd);
+
+            if let Some(in_fd) = stdin_fd {
+                if let Err(e) = epoll.add(in_fd, EPOLLOUT as u32, in_fd as u64) {
+                    eprintln!("[ERROR] epoll.add cgi stdin fd={in_fd}: {e}");
+                    // Not fatal to the exchange: stdout alone can still drive
+                    // it to completion if the script ignores stdin.
+                } else {
+                    registry.register_cgi_fd(in_fd, fd);
+                }
+            }
+
+            // Disarm the client socket itself — only the pipe fds matter
+            // until the CGI exchange finishes. EPOLLRDHUP is still added
+            // automatically by Epoll::modify, so a client disconnect mid-CGI
+            // is still detected and cleaned up via close_connection.
+            if let Err(e) = epoll.modify(fd, 0, fd as u64) {
+                eprintln!("[ERROR] epoll.modify disarm fd={fd}: {e}");
+                close_connection(fd, epoll, registry, None);
+            }
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// CGI pipe events
+// ---------------------------------------------------------------------------
+
+/// Dispatch an epoll event on a CGI pipe fd to the stdin- or stdout-side
+/// handler, based on which pipe it actually is on the owning connection.
+fn handle_cgi_event(pipe_fd: RawFd, eflags: u32, epoll: &Epoll, registry: &mut Registry) {
+    let owner_fd = match registry.cgi_owner(pipe_fd) {
+        Some(fd) => fd,
+        None => {
+            eprintln!("[WARN] cgi event on fd {pipe_fd} with no owner; dropping");
+            let _ = epoll.delete(pipe_fd);
+            unsafe { libc::close(pipe_fd) };
+            return;
+        }
+    };
+
+    let is_stdout = match registry.get_connection_mut(owner_fd).and_then(|c| c.cgi.as_ref()) {
+        Some(p) => p.stdout_fd == pipe_fd,
+        None => {
+            // Owning connection (or its CGI state) is already gone.
+            let _ = epoll.delete(pipe_fd);
+            unsafe { libc::close(pipe_fd) };
+            registry.unregister_cgi_fd(pipe_fd);
+            return;
+        }
+    };
+
+    if is_stdout {
+        handle_cgi_stdout(owner_fd, eflags, epoll, registry);
+    } else {
+        handle_cgi_stdin(pipe_fd, owner_fd, epoll, registry);
+    }
+}
+
+/// Pump available output from the CGI child into `out_buf`. On EOF or a
+/// fatal read error, finish the exchange and produce a response.
+fn handle_cgi_stdout(owner_fd: RawFd, eflags: u32, epoll: &Epoll, registry: &mut Registry) {
+    let outcome = match registry.get_connection_mut(owner_fd) {
+        None => return,
+        Some(conn) => {
+            conn.touch();
+            match conn.cgi.as_mut() {
+                Some(process) => cgi::io::pump_stdout(process),
+                None => return,
+            }
+        }
+    };
+
+    match outcome {
+        StdoutOutcome::Pending => {
+            // is_closed can fire alongside a final readable event (the child
+            // exited right after writing its last bytes); treat that as EOF
+            // too rather than waiting for a second tick that may never come.
+            if is_closed(eflags) {
+                finish_cgi(owner_fd, epoll, registry, false);
+            }
+        }
+        StdoutOutcome::Eof => {
+            finish_cgi(owner_fd, epoll, registry, false);
+        }
+        StdoutOutcome::Error => {
+            finish_cgi(owner_fd, epoll, registry, true);
+        }
+    }
+}
+
+/// Pump request-body bytes into the CGI child's stdin.
+fn handle_cgi_stdin(pipe_fd: RawFd, owner_fd: RawFd, epoll: &Epoll, registry: &mut Registry) {
+    let outcome = match registry.get_connection_mut(owner_fd) {
+        None => return,
+        Some(conn) => {
+            conn.touch();
+            match conn.cgi.as_mut() {
+                Some(process) => cgi::io::pump_stdin(process),
+                None => return,
+            }
+        }
+    };
+
+    match outcome {
+        StdinOutcome::Wrote | StdinOutcome::WouldBlock => {
+            // Stay armed for the next EPOLLOUT.
+        }
+        StdinOutcome::Finished | StdinOutcome::Broken => {
+            // pump_stdin already closed the fd (delivering EOF, or because
+            // the child went away) — just stop tracking it.
+            let _ = epoll.delete(pipe_fd);
+            registry.unregister_cgi_fd(pipe_fd);
+        }
+    }
+}
+
+/// Tear down both CGI pipes for `owner_fd`'s connection, reap the child
+/// (best-effort, non-blocking), and turn whatever was collected into a
+/// response. `force_error` is set when stdout hit a fatal read error rather
+/// than a clean EOF.
+fn finish_cgi(owner_fd: RawFd, epoll: &Epoll, registry: &mut Registry, force_error: bool) {
+    let process = match registry.get_connection_mut(owner_fd) {
+        None => return,
+        Some(conn) => conn.cgi.take(),
+    };
+    let mut process = match process {
+        Some(p) => p,
+        None => return,
+    };
+
+    let _ = epoll.delete(process.stdout_fd);
+    registry.unregister_cgi_fd(process.stdout_fd);
+    unsafe { libc::close(process.stdout_fd) };
+
+    if let Some(stdin_fd) = process.stdin_fd.take() {
+        let _ = epoll.delete(stdin_fd);
+        registry.unregister_cgi_fd(stdin_fd);
+        unsafe { libc::close(stdin_fd) };
+    }
+
+    // Best-effort, non-blocking reap. If the child hasn't exited yet (rare —
+    // it just closed stdout but may still be cleaning up), the periodic
+    // reap_children() sweep will collect it later; we never block here.
+    unsafe { libc::waitpid(process.pid, std::ptr::null_mut(), libc::WNOHANG) };
+
+    let mut response = if force_error || process.out_buf.is_empty() {
+        let body = b"<html><body><h1>502 Bad Gateway</h1>\
+                     <p>The CGI script produced no valid response.</p>\
+                     </body></html>".to_vec();
+        crate::http::response::builder::error(502, body)
+    } else {
+        cgi::build_response(std::mem::take(&mut process.out_buf))
+    };
+
+    let conn = match registry.get_connection_mut(owner_fd) {
+        None => return,
+        Some(c) => c,
+    };
+
+    if !conn.keep_alive {
+        response.headers.set("Connection", "close");
+    }
+    conn.set_response(serialize(&response));
+
+    if let Err(e) = epoll.modify(owner_fd, EPOLLOUT as u32, owner_fd as u64) {
+        eprintln!("[ERROR] epoll.modify EPOLLOUT fd={owner_fd}: {e}");
+        close_connection(owner_fd, epoll, registry, None);
     }
 }
 
@@ -290,18 +467,35 @@ fn close_connection(
     registry: &mut Registry,
     response: Option<&[u8]>,
 ) {
-    // Best-effort synchronous write for in-flight error responses.
     if let Some(data) = response {
         unsafe { libc::write(fd, data.as_ptr() as *const _, data.len()) };
     }
 
-    // Remove from epoll. ENOENT means it was never added or already removed.
+    // If a CGI exchange was in flight for this connection, tear it down
+    // first: kill the child, close both pipes, and stop tracking them —
+    // otherwise they'd leak (fd exhaustion under siege) and the child would
+    // become a zombie once it exits.
+    if let Some(mut process) = registry.get_connection_mut(fd).and_then(|c| c.cgi.take()) {
+        unsafe { libc::kill(process.pid, libc::SIGKILL) };
+
+        let _ = epoll.delete(process.stdout_fd);
+        registry.unregister_cgi_fd(process.stdout_fd);
+        unsafe { libc::close(process.stdout_fd) };
+
+        if let Some(stdin_fd) = process.stdin_fd.take() {
+            let _ = epoll.delete(stdin_fd);
+            registry.unregister_cgi_fd(stdin_fd);
+            unsafe { libc::close(stdin_fd) };
+        }
+
+        unsafe { libc::waitpid(process.pid, std::ptr::null_mut(), libc::WNOHANG) };
+    }
+
     if let Err(e) = epoll.delete(fd) {
         eprintln!("[DEBUG] epoll.delete fd={fd}: {e}");
     }
 
     registry.remove(fd);
-
     unsafe { libc::close(fd) };
 
     eprintln!("[INFO] Closed connection fd={fd}");
@@ -389,6 +583,11 @@ enum Transition {
     NeedMoreData,
     ResponseReady,
     Close,
+    /// CGI child spawned; `stdout_fd` must be registered for `EPOLLIN` and
+    /// `stdin_fd` (if `Some`) for `EPOLLOUT`. Carried out of `process_request`
+    /// as plain fds (not the `CgiProcess` itself) because registering them
+    /// needs `&mut Registry`, which can't be borrowed while `conn` is.
+    CgiStarted { stdout_fd: RawFd, stdin_fd: Option<RawFd> },
 }
 
 /// Advance the connection through its parse → route → respond pipeline.
@@ -511,20 +710,48 @@ fn process_request(conn: &mut ConnectionState, configs: &[ServerConfig]) -> Tran
         }
     };
 
-    let mut response = dispatch(&req, route, server);
+    match dispatch(&req, route, server) {
+        DispatchOutcome::Response(mut response) => {
+            if !conn.keep_alive {
+                response.headers.set("Connection", "close");
+            }
+            let bytes = if req.method == crate::config::types::Method::Head {
+                crate::http::response::writer::serialize_head_response(&response)
+            } else {
+                serialize(&response)
+            };
+            conn.set_response(bytes);
+            Transition::ResponseReady
+        }
 
-    if !conn.keep_alive {
-        response.headers.set("Connection", "close");
+        DispatchOutcome::StartCgi(target) => {
+            match cgi::executor::spawn(&target, &req, server, conn.local_port, conn.peer_addr) {
+                Ok(mut process) => {
+                    // No body to send (GET, or POST with an empty body):
+                    // close stdin immediately so the child sees EOF and we
+                    // never register a stdin fd that would sit idle forever.
+                    if process.body.is_empty() {
+                        process.close_stdin();
+                    }
+                    let stdout_fd = process.stdout_fd;
+                    let stdin_fd  = process.stdin_fd;
+
+                    conn.phase = ConnectionPhase::AwaitingCgi {
+                        child_pid: process.pid,
+                        pipe_fd:   stdout_fd,
+                    };
+                    conn.cgi = Some(process);
+
+                    Transition::CgiStarted { stdout_fd, stdin_fd }
+                }
+                Err(e) => {
+                    eprintln!("[WARN] CGI spawn failed: {e}");
+                    conn.set_response(HTTP_502.to_vec());
+                    Transition::ResponseReady
+                }
+            }
+        }
     }
-
-    let bytes = if req.method == crate::config::types::Method::Head {
-        crate::http::response::writer::serialize_head_response(&response)
-    } else {
-        serialize(&response)
-    };
-
-    conn.set_response(bytes);
-    Transition::ResponseReady
 }
 
 enum FlushResult {
@@ -584,6 +811,14 @@ Content-Length: 21\r\n\
 Connection: close\r\n\
 \r\n\
 Internal Server Error";
+
+const HTTP_502: &[u8] = b"\
+HTTP/1.1 502 Bad Gateway\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+Content-Length: 98\r\n\
+Connection: close\r\n\
+\r\n\
+<html><head><title>502 Bad Gateway</title></head><body><h1>502 Bad Gateway</h1></body></html>";
 
 /// Reap all finished child processes (CGI) to prevent zombies.
 ///

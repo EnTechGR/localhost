@@ -8,7 +8,6 @@
 //! - [`error`]       — error page rendering with custom page support
 pub mod delete;
 pub mod directory;
-pub mod error;
 pub mod redirect;
 pub mod static_file;
 pub mod upload;

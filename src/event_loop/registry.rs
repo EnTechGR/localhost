@@ -45,6 +45,8 @@ pub struct ListenerEntry {
 pub struct Registry {
     listeners:   HashMap<RawFd, ListenerEntry>,
     connections: HashMap<RawFd, ConnectionState>,
+    /// Maps a CGI pipe fd (stdin or stdout) to the connection fd that owns it.
+    cgi_fds: HashMap<RawFd, RawFd>,
 }
 
 impl Registry {
@@ -53,6 +55,7 @@ impl Registry {
         Registry {
             listeners:   HashMap::new(),
             connections: HashMap::new(),
+            cgi_fds: HashMap::new(),
         }
     }
 
@@ -148,6 +151,28 @@ impl Registry {
     /// Number of registered listeners.
     pub fn listener_count(&self) -> usize {
         self.listeners.len()
+    }
+
+    /// Record that `pipe_fd` belongs to the CGI exchange running on behalf
+    /// of `owner_fd` (the client connection's socket fd).
+    pub fn register_cgi_fd(&mut self, pipe_fd: RawFd, owner_fd: RawFd) {
+        self.cgi_fds.insert(pipe_fd, owner_fd);
+    }
+
+    /// Returns `true` if `fd` is a currently-registered CGI pipe.
+    #[inline]
+    pub fn is_cgi_fd(&self, fd: RawFd) -> bool {
+        self.cgi_fds.contains_key(&fd)
+    }
+
+    /// The connection fd that owns `pipe_fd`, if any.
+    pub fn cgi_owner(&self, pipe_fd: RawFd) -> Option<RawFd> {
+        self.cgi_fds.get(&pipe_fd).copied()
+    }
+
+    /// Stop tracking `pipe_fd`. Called once it's removed from epoll and closed.
+    pub fn unregister_cgi_fd(&mut self, pipe_fd: RawFd) {
+        self.cgi_fds.remove(&pipe_fd);
     }
 }
 

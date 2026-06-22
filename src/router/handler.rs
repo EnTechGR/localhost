@@ -12,6 +12,30 @@ use crate::http::request::types::Request;
 use crate::http::response::{builder, types::Response};
 use crate::config::types::Method;
 use crate::handlers::{delete, redirect as redirect_handler, static_file, upload};
+use crate::cgi::{self, CgiTarget};
+
+/// What `dispatch` decided to do with a request.
+///
+/// CGI can't be resolved synchronously into a `Response` — spawning the
+/// child and pumping its pipes spans multiple `epoll_wait` ticks — so this
+/// enum lets the dispatcher act on either outcome.
+pub enum DispatchOutcome {
+    Response(Response),
+    StartCgi(CgiTarget),
+}
+
+impl DispatchOutcome {
+    /// Convenience for call sites (tests, mainly) that don't expect CGI.
+    /// Panics if a CGI target was returned instead of a response.
+    #[cfg(test)]
+    pub fn unwrap_response(self) -> Response {
+        match self {
+            DispatchOutcome::Response(r) => r,
+            DispatchOutcome::StartCgi(_) => panic!("expected Response, got StartCgi"),
+        }
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // dispatch
@@ -25,37 +49,35 @@ pub fn dispatch(
     request: &Request,
     route:   &RouteConfig,
     server:  &ServerConfig,
-) -> Response {
+) -> DispatchOutcome {
     // ------------------------------------------------------------------
     // 1. Method check
     // ------------------------------------------------------------------
     if !route.allows_method(&request.method) {
-        return builder::method_not_allowed(&route.methods);
+        return DispatchOutcome::Response(builder::method_not_allowed(&route.methods));
     }
 
     // ------------------------------------------------------------------
     // 2. Redirect
     // ------------------------------------------------------------------
     if let Some(redir) = &route.redirect {
-        return redirect_handler::redirect(redir.code, &redir.target);
+        return DispatchOutcome::Response(redirect_handler::redirect(redir.code, &redir.target));
     }
 
     // ------------------------------------------------------------------
-    // 3. CGI extension check
-    // ------------------------------------------------------------------
-    if let Some(ext) = file_extension(&request.path) {
-        if route.cgi_for_extension(ext).is_some() {
-            return cgi_not_implemented();
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // 4. Body size limit
+    // 3. Body size limit
     // ------------------------------------------------------------------
     let limit = route.client_body_limit
         .unwrap_or(server.body_limit());
     if request.body.len() > limit {
-        return builder::payload_too_large();
+        return DispatchOutcome::Response(builder::payload_too_large());
+    }
+
+    // ------------------------------------------------------------------
+    // 4. CGI extension check
+    // ------------------------------------------------------------------
+    if let Some(target) = cgi::cgi_target(request, route) {
+        return DispatchOutcome::StartCgi(target);
     }
 
     // ------------------------------------------------------------------
@@ -65,14 +87,13 @@ pub fn dispatch(
         .error_page(404)
         .and_then(|path| std::fs::read_to_string(path).ok());
 
-    match request.method {
+    let response = match request.method {
         Method::Get | Method::Head => {
             let mut resp = static_file::serve(
                 request,
                 route,
                 error_page_404.as_deref(),
             );
-            // HEAD: strip the body, keep all headers.
             if request.method == Method::Head {
                 resp.body.clear();
             }
@@ -89,14 +110,15 @@ pub fn dispatch(
         }
 
         Method::Put => {
-            // Not in the required set; 405.
             builder::method_not_allowed(&[Method::Get, Method::Post, Method::Delete])
         }
 
         Method::Options => {
             options_response(route)
         }
-    }
+    };
+
+    DispatchOutcome::Response(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -124,25 +146,6 @@ fn options_response(route: &RouteConfig) -> Response {
     let mut resp = builder::no_content();
     resp.headers.set("Allow", allow);
     resp
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// CGI execution is implemented in a later step.
-fn cgi_not_implemented() -> Response {
-    let body = b"<html><body><h1>501 Not Implemented</h1>\
-                 <p>CGI support is not yet enabled.</p></body></html>".to_vec();
-    builder::error(501, body)
-}
-
-/// Extract the file extension from a URL path (lowercase, without the dot).
-fn file_extension(path: &str) -> Option<&str> {
-    let filename = path.rsplit('/').next().unwrap_or(path);
-    filename.rsplit('.').next().filter(|ext| {
-        !ext.is_empty() && *ext != filename
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +208,7 @@ mod tests {
         let dir = tmp_dir();
         let route = route_get_only(&dir);
         let req   = Request { method: Method::Post, ..get("/") };
+        
         let resp  = dispatch(&req, &route, &server());
         fs::remove_dir_all(&dir).ok();
         assert_eq!(resp.status.code(), 405);
@@ -278,19 +282,5 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
         assert_eq!(resp.status.code(), 204);
         assert!(resp.headers.get("Allow").is_some());
-    }
-
-    // ---- file_extension helper ----------------------------------------------
-
-    #[test]
-    fn extension_extracted() {
-        assert_eq!(super::file_extension("/path/to/file.py"), Some("py"));
-        assert_eq!(super::file_extension("/file.html"),       Some("html"));
-    }
-
-    #[test]
-    fn no_extension_returns_none() {
-        assert_eq!(super::file_extension("/no-ext"), None);
-        assert_eq!(super::file_extension("/"),        None);
     }
 }

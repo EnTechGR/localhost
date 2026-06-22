@@ -9,6 +9,7 @@ use crate::config::types::RouteConfig;
 use crate::http::request::types::Request;
 use crate::http::response::{builder, types::Response};
 use crate::utils::{mime, path as pathutil};
+use crate::handlers::directory;
 
 // ---------------------------------------------------------------------------
 // Public handler
@@ -41,13 +42,14 @@ pub fn serve(request: &Request, route: &RouteConfig, error_page_404: Option<&str
         }
     };
 
-    serve_path(&fs_path, route, error_page_404)
+     serve_path(&fs_path, &request.path, route, error_page_404)
 }
 
 /// Core serving logic once we have a `PathBuf`.
 /// Exported so the directory handler can reuse it for individual entries.
 pub fn serve_path(
     fs_path:       &Path,
+    url_path:      &str,
     route:         &RouteConfig,
     error_page_404: Option<&str>,
 ) -> Response {
@@ -64,7 +66,7 @@ pub fn serve_path(
 
         // Directory listing.
         if route.directory_listing {
-            return serve_directory_listing(fs_path);
+            return directory::render_listing(fs_path, url_path);
         }
 
         // No index and listing disabled → 403.
@@ -95,71 +97,6 @@ fn serve_file(path: &Path) -> Response {
                 _           => builder::internal_server_error(None),
             }
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Directory listing
-// ---------------------------------------------------------------------------
-
-fn serve_directory_listing(dir: &Path) -> Response {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e)  => e,
-        Err(_) => return builder::forbidden(None),
-    };
-
-    let dir_display = dir.to_str().unwrap_or("/");
-
-    let mut rows = String::new();
-    // Parent directory link (unless at root).
-    rows.push_str("<tr><td><a href=\"../\">../</a></td><td>-</td></tr>\n");
-
-    let mut names: Vec<_> = entries
-        .filter_map(|e| e.ok())
-        .collect();
-    names.sort_by_key(|e| e.file_name());
-
-    for entry in names {
-        let name     = entry.file_name();
-        let name_str = name.to_string_lossy();
-        let is_dir   = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let href     = if is_dir {
-            format!("{name_str}/")
-        } else {
-            name_str.to_string()
-        };
-        let size = if is_dir {
-            "-".to_string()
-        } else {
-            entry.metadata()
-                .map(|m| format_size(m.len()))
-                .unwrap_or_else(|_| "?".to_string())
-        };
-        rows.push_str(&format!(
-            "<tr><td><a href=\"{href}\">{href}</a></td><td>{size}</td></tr>\n"
-        ));
-    }
-
-    let body = format!(
-        "<!DOCTYPE html>\n\
-         <html><head><title>Index of {dir_display}</title>\
-         <style>body{{font-family:monospace}}td{{padding:0 1em}}</style></head>\n\
-         <body><h1>Index of {dir_display}</h1>\n\
-         <table><tr><th>Name</th><th>Size</th></tr>\n\
-         {rows}\
-         </table></body></html>\n"
-    ).into_bytes();
-
-    builder::ok(body, "text/html; charset=utf-8")
-}
-
-fn format_size(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KiB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
 
@@ -294,12 +231,5 @@ mod tests {
         let resp  = serve(&get("/style.css"), &route, None);
         fs::remove_dir_all(&dir).ok();
         assert_eq!(resp.headers.get("Content-Type"), Some("text/css; charset=utf-8"));
-    }
-
-    #[test]
-    fn format_size_units() {
-        assert_eq!(super::format_size(500),         "500 B");
-        assert_eq!(super::format_size(2048),        "2.0 KiB");
-        assert_eq!(super::format_size(1024 * 1024), "1.0 MiB");
     }
 }
