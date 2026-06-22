@@ -136,20 +136,24 @@ pub fn bind_listeners(
 // ---------------------------------------------------------------------------
 
 /// Parse `"host:port"` into a `SocketAddr`.
+///
+/// Plain IPv4 and pre-bracketed IPv6 literals (`"[::1]:8080"`) parse directly
+/// via `addr_str`. Bare IPv6 hosts in the config (`"::1"`, no brackets) fail
+/// the first parse — `Ipv6Addr::to_string` requires brackets to combine with
+/// a port — so we retry with brackets added before giving up.
 fn parse_socket_addr(
     addr_str: &str,
     host:     &str,
     port:     u16,
 ) -> Result<SocketAddr, ListenerError> {
-    addr_str.parse::<SocketAddr>().map_err(|_| {
-        // Try prepending IPv6 brackets if it looks like an IPv6 address.
-        let bracketed = format!("[{host}]:{port}");
-        bracketed.parse::<SocketAddr>().unwrap_or_else(|_| {
-            // Return a dummy to satisfy the type; the outer Err path is taken.
-            "0.0.0.0:0".parse().unwrap()
-        });
-        ListenerError::InvalidHost(host.to_string())
-    })
+    if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+
+    let bracketed = format!("[{host}]:{port}");
+    bracketed
+        .parse::<SocketAddr>()
+        .map_err(|_| ListenerError::InvalidHost(host.to_string()))
 }
 
 /// Create a `SOCK_STREAM` socket appropriate for `addr`.
@@ -413,6 +417,23 @@ mod tests {
             }
         }
         assert!(result.is_ok(), "bind failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn bare_ipv6_host_binds_via_bracket_retry() {
+        // "::1" (no brackets) fails the direct "host:port" parse and must
+        // fall through to the bracketed retry in `parse_socket_addr`.
+        let configs = vec![test_server("::1", 17899)];
+        let epoll   = Epoll::create().unwrap();
+        let mut reg = Registry::new();
+        let result  = bind_listeners(&configs, &epoll, &mut reg);
+
+        if let Ok(ref bound) = result {
+            for &(fd, _) in bound {
+                unsafe { libc::close(fd) };
+            }
+        }
+        assert!(result.is_ok(), "IPv6 bind failed: {:?}", result.err());
     }
 
     #[test]

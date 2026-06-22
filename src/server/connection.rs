@@ -125,6 +125,11 @@ pub struct ConnectionState {
     /// only carries `child_pid`/`pipe_fd` for Debug/timeout purposes) so the
     /// non-blocking I/O helpers in `cgi::io` can operate on it directly.
     pub cgi: Option<CgiProcess>,
+
+    /// Session ID to send back via `Set-Cookie` on the next response, if a
+    /// new session was created for the in-flight request. `None` once
+    /// attached (or if the request reused an existing session).
+    pub pending_session_cookie: Option<crate::session::SessionId>,
 }
 
 
@@ -142,7 +147,8 @@ impl ConnectionState {
             last_activity: Instant::now(),
             peer_addr,
             keep_alive:    false,
-            cgi:           None,
+            cgi:                    None,
+            pending_session_cookie: None,
         }
     }
 
@@ -220,7 +226,8 @@ impl ConnectionState {
             self.read_buf.clear();
             self.write_buf.clear();
             self.request = None;
-            self.cgi     = None;
+            self.cgi                    = None;
+            self.pending_session_cookie = None;
             self.phase   = ConnectionPhase::ReadingHeaders;
             self.touch();
             true

@@ -41,6 +41,7 @@ use crate::server::listener::{accept_one, AcceptResult};
 use crate::server::timeout::{canned_response, timeout_for_phase, TimeoutClass};
 use crate::cgi::{self, io::{StdinOutcome, StdoutOutcome}};
 use crate::router::handler::DispatchOutcome;
+use crate::session::{self, SessionStore};
 
 /// How many events we ask `epoll_wait` to return per call.
 const MAX_EVENTS: usize = 128;
@@ -52,6 +53,11 @@ const EPOLL_TIMEOUT_MS: i32 = 1_000; // 1 second
 /// Soft cap on simultaneous connections. Prevents fd exhaustion under siege.
 /// The OS default ulimit is typically 1024; we stay well under that.
 const MAX_CONNECTIONS: usize = 512;
+
+/// How long a session may sit idle before `purge_expired` evicts it.
+/// Matches `CookieOptions::default()`'s `Max-Age` so the cookie and the
+/// server-side record expire together.
+const SESSION_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
 
 // ---------------------------------------------------------------------------
 // run()
@@ -66,6 +72,7 @@ const MAX_CONNECTIONS: usize = 512;
 pub fn run(epoll: Epoll, mut registry: Registry, configs: Vec<ServerConfig>) -> ! {
     let mut events: Vec<epoll_event> =
         vec![unsafe { std::mem::zeroed() }; MAX_EVENTS];
+    let mut sessions = SessionStore::new();
 
     eprintln!(
         "[INFO] Event loop started: {} listener(s) registered",
@@ -82,15 +89,11 @@ pub fn run(epoll: Epoll, mut registry: Registry, configs: Vec<ServerConfig>) -> 
         let n = match epoll.wait(&mut events, EPOLL_TIMEOUT_MS) {
             Ok(n) => n,
             Err(e) => {
-                // epoll_wait failing is catastrophic — log and continue; the
-                // OS error is almost certainly transient (EINTR is retried
-                // inside Epoll::wait already).
                 eprintln!("[ERROR] epoll_wait: {e}");
                 continue;
             }
         };
 
-        // Dispatch each fired event.
         for i in 0..n {
             let event  = events[i];
             let fd     = event.u64 as RawFd;
@@ -103,14 +106,14 @@ pub fn run(epoll: Epoll, mut registry: Registry, configs: Vec<ServerConfig>) -> 
             } else if is_closed(eflags) {
                 close_connection(fd, &epoll, &mut registry, None);
             } else if is_readable(eflags) {
-                read_from_connection(fd, &epoll, &mut registry, &configs);
+                read_from_connection(fd, &epoll, &mut registry, &configs, &mut sessions);
             } else if is_writable(eflags) {
                 write_to_connection(fd, &epoll, &mut registry);
             }
         }
 
-        // Periodic timeout sweep — runs once per epoll_wait tick.
         check_timeouts(&mut registry, &epoll);
+        sessions.purge_expired(SESSION_MAX_AGE);
         reap_children();
     }
 }
@@ -182,6 +185,7 @@ fn read_from_connection(
     epoll:    &Epoll,
     registry: &mut Registry,
     configs:  &[ServerConfig],
+    sessions: &mut SessionStore,
 ) {
     // Drain available bytes into the read buffer.
     let should_close = match registry.get_connection_mut(fd) {
@@ -211,7 +215,7 @@ fn read_from_connection(
     // Advance the connection through parse → route → respond.
     let transition = match registry.get_connection_mut(fd) {
         None => return,
-        Some(conn) => advance_connection(conn, configs),
+        Some(conn) => advance_connection(conn, configs, sessions),
     };
 
     match transition {
@@ -397,6 +401,7 @@ fn finish_cgi(owner_fd: RawFd, epoll: &Epoll, registry: &mut Registry, force_err
         Some(c) => c,
     };
 
+    attach_pending_cookie(conn, &mut response);
     if !conn.keep_alive {
         response.headers.set("Connection", "close");
     }
@@ -594,25 +599,19 @@ enum Transition {
 ///
 /// All phase transitions use the methods on `ConnectionState`; the
 /// dispatcher does not manipulate `conn.phase` directly.
-fn advance_connection(conn: &mut ConnectionState, configs: &[ServerConfig]) -> Transition {
+fn advance_connection(conn: &mut ConnectionState, configs: &[ServerConfig], sessions: &mut SessionStore) -> Transition {
     loop {
         match &conn.phase {
-            // ----------------------------------------------------------------
-            // Phase 1: parse request headers
-            // ----------------------------------------------------------------
             ConnectionPhase::ReadingHeaders => {
                 match parse_request_head(&conn.read_buf) {
                     ParseResult::Incomplete => return Transition::NeedMoreData,
-
                     ParseResult::Error(e) => {
                         eprintln!("[WARN] parse error fd={}: {e}", conn.fd);
                         conn.set_response(HTTP_400.to_vec());
                         return Transition::ResponseReady;
                     }
-
                     ParseResult::Complete(req, consumed) => {
                         let body_so_far = conn.read_buf[consumed..].to_vec();
-
                         if req.is_chunked() {
                             conn.begin_reading_chunked(req, body_so_far);
                             continue;
@@ -622,7 +621,7 @@ fn advance_connection(conn: &mut ConnectionState, configs: &[ServerConfig]) -> T
                                 conn.request = Some(req);
                                 conn.read_buf.clear();
                                 conn.phase = ConnectionPhase::Processing;
-                                return process_request(conn, configs);
+                                return process_request(conn, configs, sessions);
                             }
                             conn.begin_reading_body(req, cl, body_so_far);
                             continue;
@@ -631,29 +630,23 @@ fn advance_connection(conn: &mut ConnectionState, configs: &[ServerConfig]) -> T
                             conn.request = Some(req);
                             conn.read_buf.clear();
                             conn.phase = ConnectionPhase::Processing;
-                            return process_request(conn, configs);
+                            return process_request(conn, configs, sessions);
                         }
                     }
                 }
             }
 
-            // ----------------------------------------------------------------
-            // Phase 2a: fixed-length body
-            // ----------------------------------------------------------------
             ConnectionPhase::ReadingBody { expected, .. } => {
                 let expected = *expected;
                 match read_body_unchunked(&conn.read_buf, expected) {
                     BodyResult::NeedsMore { .. } => return Transition::NeedMoreData,
                     BodyResult::Complete(body) => {
                         conn.complete_body(body);
-                        return process_request(conn, configs);
+                        return process_request(conn, configs, sessions);
                     }
                 }
             }
 
-            // ----------------------------------------------------------------
-            // Phase 2b: chunked body
-            // ----------------------------------------------------------------
             ConnectionPhase::ReadingChunked { assembled } => {
                 let assembled = assembled.clone();
                 match read_body_chunked(&assembled) {
@@ -665,7 +658,7 @@ fn advance_connection(conn: &mut ConnectionState, configs: &[ServerConfig]) -> T
                     }
                     ChunkedResult::Complete(body, _) => {
                         conn.complete_body(body);
-                        return process_request(conn, configs);
+                        return process_request(conn, configs, sessions);
                     }
                 }
             }
@@ -679,7 +672,11 @@ fn advance_connection(conn: &mut ConnectionState, configs: &[ServerConfig]) -> T
 }
 
 /// Dispatch the stored `Request` and serialise the response.
-fn process_request(conn: &mut ConnectionState, configs: &[ServerConfig]) -> Transition {
+fn process_request(
+    conn:     &mut ConnectionState,
+    configs:  &[ServerConfig],
+    sessions: &mut SessionStore,
+) -> Transition {
     if configs.is_empty() {
         conn.set_response(HTTP_500.to_vec());
         return Transition::ResponseReady;
@@ -693,6 +690,27 @@ fn process_request(conn: &mut ConnectionState, configs: &[ServerConfig]) -> Tran
         }
     };
 
+    // ------------------------------------------------------------------
+    // Session resolution: reuse the cookie's session if it still exists,
+    // otherwise mint a new one and remember to send it back. We don't
+    // resend Set-Cookie on every request — only when a session is created
+    // — matching the module's documented contract.
+    // ------------------------------------------------------------------
+    let existing_id = req.headers.get("cookie").and_then(|header| {
+        let cookies = session::parse_cookies(header);
+        session::extract_session_id(&cookies).map(str::to_string)
+    });
+
+    match existing_id {
+        Some(id) if sessions.get_mut(&id).is_some() => {
+            // Known session, already touched by get_mut. Nothing to send.
+        }
+        _ => {
+            let id = sessions.create();
+            conn.pending_session_cookie = Some(id);
+        }
+    }
+
     let server = select_server(req.host(), conn.local_port, configs);
 
     let route = match match_route(&req.path, &server.routes) {
@@ -701,6 +719,7 @@ fn process_request(conn: &mut ConnectionState, configs: &[ServerConfig]) -> Tran
             let page  = server.error_page(404)
                 .and_then(|p| std::fs::read_to_string(p).ok());
             let mut resp = crate::http::response::builder::not_found(page.as_deref());
+            attach_pending_cookie(conn, &mut resp);
             if !conn.keep_alive {
                 resp.headers.set("Connection", "close");
             }
@@ -712,6 +731,7 @@ fn process_request(conn: &mut ConnectionState, configs: &[ServerConfig]) -> Tran
 
     match dispatch(&req, route, server) {
         DispatchOutcome::Response(mut response) => {
+            attach_pending_cookie(conn, &mut response);
             if !conn.keep_alive {
                 response.headers.set("Connection", "close");
             }
@@ -727,9 +747,6 @@ fn process_request(conn: &mut ConnectionState, configs: &[ServerConfig]) -> Tran
         DispatchOutcome::StartCgi(target) => {
             match cgi::executor::spawn(&target, &req, server, conn.local_port, conn.peer_addr) {
                 Ok(mut process) => {
-                    // No body to send (GET, or POST with an empty body):
-                    // close stdin immediately so the child sees EOF and we
-                    // never register a stdin fd that would sit idle forever.
                     if process.body.is_empty() {
                         process.close_stdin();
                     }
@@ -751,6 +768,20 @@ fn process_request(conn: &mut ConnectionState, configs: &[ServerConfig]) -> Tran
                 }
             }
         }
+    }
+}
+
+/// Attach the `Set-Cookie` header for a freshly created session, if one was
+/// minted for this request. No-op (and clears nothing) if the request reused
+/// an existing session.
+fn attach_pending_cookie(conn: &mut ConnectionState, response: &mut crate::http::response::types::Response) {
+    if let Some(id) = conn.pending_session_cookie.take() {
+        let value = session::set_cookie_header(
+            session::SESSION_COOKIE,
+            &id,
+            &session::CookieOptions::default(),
+        );
+        response.headers.append("Set-Cookie", value);
     }
 }
 
@@ -859,7 +890,7 @@ mod tests {
     fn stub_returns_need_more_data_without_double_crlf() {
         let mut c = conn(5);
         c.read_buf.extend_from_slice(b"GET / HTTP/1.1\r\nHost: localhost");
-        let result = advance_connection(&mut c, &[]);
+        let result = advance_connection(&mut c, &[], &mut SessionStore::new());
         assert!(matches!(result, Transition::NeedMoreData));
     }
 
@@ -867,7 +898,7 @@ mod tests {
     fn stub_returns_response_ready_with_double_crlf() {
         let mut c = conn(5);
         c.read_buf.extend_from_slice(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        let result = advance_connection(&mut c, &[]);
+        let result = advance_connection(&mut c, &[], &mut SessionStore::new());
         // With no configs the server falls through to HTTP_500 or 404;
         // either way the response is ready and the phase is WritingResponse.
         assert!(matches!(result, Transition::ResponseReady));
@@ -879,7 +910,7 @@ mod tests {
         let mut c = conn(5);
         c.read_buf.extend(b"GET / HTTP/1.1\r\nX-Pad: ".iter().copied());
         c.read_buf.extend(vec![b'A'; crate::http::request::parser::MAX_HEADER_BYTES + 1]);
-        let result = advance_connection(&mut c, &[]);
+        let result = advance_connection(&mut c, &[], &mut SessionStore::new());
         assert!(matches!(result, Transition::ResponseReady));
         assert!(c.write_buf.starts_with(b"HTTP/1.1 400"));
     }
