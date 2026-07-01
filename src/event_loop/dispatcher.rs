@@ -1059,4 +1059,195 @@ mod tests {
         };
         (fds[0], fds[1])
     }
+
+    // ---- check_timeouts sends correct response before closing --------------
+
+    /// Verify that `check_timeouts` writes the correct canned 408 response
+    /// to the client socket before removing the connection from the registry.
+    #[test]
+    fn check_timeouts_sends_408_response_bytes() {
+        let (rd, wr) = make_socket_pair();
+
+        let epoll   = Epoll::create().unwrap();
+        let mut reg = Registry::new();
+
+        epoll.add(wr, EPOLLIN as u32, wr as u64).unwrap();
+
+        // Register a connection in `ReadingHeaders` (which maps to 408).
+        let mut c = conn(wr);
+        c.last_activity = std::time::Instant::now()
+            - std::time::Duration::from_secs(9999);
+        reg.register_connection(wr, c);
+
+        check_timeouts(&mut reg, &epoll);
+
+        // Connection should have been removed.
+        assert!(reg.get_connection(wr).is_none());
+
+        // Read the response that was written to the socket.
+        let mut buf = [0u8; 512];
+        let n = unsafe {
+            libc::read(rd, buf.as_mut_ptr() as *mut _, buf.len())
+        };
+        assert!(n > 0, "server should have sent a response");
+
+        let resp = std::str::from_utf8(&buf[..n as usize])
+            .expect("response must be valid UTF-8");
+        assert!(resp.starts_with("HTTP/1.1 408"),
+                "expected 408 response, got: {:?}", resp.lines().next());
+
+        unsafe { libc::close(rd) };
+    }
+
+    /// Verify that `check_timeouts` sends a 504 Gateway Timeout for
+    /// phases mapped to `GatewayTimeout`.
+    #[test]
+    fn check_timeouts_sends_504_for_gateway_timeout_phases() {
+        for phase in [
+            ConnectionPhase::Processing,
+            ConnectionPhase::WritingResponse  { bytes_written: 0 },
+            ConnectionPhase::AwaitingCgi,
+        ] {
+            let (rd, wr) = make_socket_pair();
+
+            let epoll   = Epoll::create().unwrap();
+            let mut reg = Registry::new();
+
+            epoll.add(wr, EPOLLIN as u32, wr as u64).unwrap();
+
+            let phase_label = format!("{:?}", phase);
+
+            let mut c = conn(wr);
+            c.phase     = phase;
+            c.last_activity = std::time::Instant::now()
+                - std::time::Duration::from_secs(9999);
+            reg.register_connection(wr, c);
+
+            check_timeouts(&mut reg, &epoll);
+
+            assert!(reg.get_connection(wr).is_none(),
+                    "connection removed for phase {}", phase_label);
+
+            let mut buf = [0u8; 512];
+            let n = unsafe {
+                libc::read(rd, buf.as_mut_ptr() as *mut _, buf.len())
+            };
+            assert!(n > 0, "server should have sent a response for {}", phase_label);
+
+            let resp = std::str::from_utf8(&buf[..n as usize])
+                .expect("response must be valid UTF-8");
+            assert!(resp.starts_with("HTTP/1.1 504"),
+                    "expected 504 for {}, got: {:?}", phase_label, resp.lines().next());
+
+            unsafe { libc::close(rd) };
+        }
+    }
+
+    /// Verify that `check_timeouts` sends a response with the correct
+    /// Content-Length matching the actual body.
+    #[test]
+    fn check_timeouts_response_content_length_matches_body() {
+        let (rd, wr) = make_socket_pair();
+
+        let epoll   = Epoll::create().unwrap();
+        let mut reg = Registry::new();
+
+        epoll.add(wr, EPOLLIN as u32, wr as u64).unwrap();
+
+        let mut c = conn(wr);
+        c.last_activity = std::time::Instant::now()
+            - std::time::Duration::from_secs(9999);
+        reg.register_connection(wr, c);
+
+        check_timeouts(&mut reg, &epoll);
+
+        // Read the full response.
+        let mut buf = [0u8; 512];
+        let n = unsafe {
+            libc::read(rd, buf.as_mut_ptr() as *mut _, buf.len())
+        };
+        assert!(n > 0, "response should be received");
+
+        let resp = &buf[..n as usize];
+        let sep = resp.windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("response must contain header/body separator");
+
+        // Parse Content-Length from the response headers.
+        let header_str = std::str::from_utf8(&resp[..sep])
+            .expect("headers must be valid UTF-8");
+        let cl_line = header_str.lines()
+            .find(|l| l.to_lowercase().starts_with("content-length:"))
+            .expect("response must have Content-Length header");
+        let cl: usize = cl_line.split(':')
+            .nth(1).unwrap().trim().parse().unwrap();
+
+        // Actual body starts after \r\n\r\n.
+        let actual_body_len = resp.len() - sep - 4;
+        assert_eq!(cl, actual_body_len,
+                    "Content-Length ({}) must match actual body length ({})",
+                    cl, actual_body_len);
+
+        unsafe { libc::close(rd) };
+    }
+
+    /// Verify that `check_timeouts` does NOT remove connections that are
+    /// still active (within their timeout window).
+    #[test]
+    fn check_timeouts_preserves_active_connections() {
+        let (_rd, wr) = make_socket_pair();
+
+        let epoll   = Epoll::create().unwrap();
+        let mut reg = Registry::new();
+
+        epoll.add(wr, EPOLLIN as u32, wr as u64).unwrap();
+
+        let mut c = conn(wr);
+        // last_activity is already "now" from ConnectionState::new.
+        reg.register_connection(wr, c);
+
+        check_timeouts(&mut reg, &epoll);
+
+        assert!(reg.get_connection(wr).is_some(),
+                "active connection must not be removed");
+
+        unsafe { libc::close(wr) };
+    }
+
+    /// Verify that `check_timeouts` correctly applies phase-specific timeouts:
+    // a Processing-phase connection with 10s timeout should NOT time out when
+    // only 5s has elapsed.
+    #[test]
+    fn check_timeouts_respects_phase_specific_durations() {
+        for (phase, timeout_dur) in [
+            (ConnectionPhase::Processing,   std::time::Duration::from_secs(5)),
+            (ConnectionPhase::ReadingHeaders,  std::time::Duration::from_secs(30)),
+            (ConnectionPhase::WritingResponse { bytes_written: 0 }, std::time::Duration::from_secs(60)),
+        ] {
+            let (rd, wr) = make_socket_pair();
+
+            let epoll   = Epoll::create().unwrap();
+            let mut reg = Registry::new();
+
+            epoll.add(wr, EPOLLIN as u32, wr as u64).unwrap();
+
+            // Set last_activity to 1 second ago — well within timeout.
+            let phase_label = format!("{:?}", phase);
+
+            let mut c = conn(wr);
+            c.phase     = phase;
+            c.last_activity = std::time::Instant::now()
+                - std::time::Duration::from_secs(1);
+            reg.register_connection(wr, c);
+
+            check_timeouts(&mut reg, &epoll);
+
+            assert!(reg.get_connection(wr).is_some(),
+                    "connection should remain for {} (timeout {}s, elapsed 1s)",
+                    phase_label, timeout_dur.as_secs());
+
+            unsafe { libc::close(rd) };
+            unsafe { libc::close(wr) };
+        }
+    }
 }

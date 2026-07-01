@@ -29,8 +29,23 @@ use crate::server::connection::ConnectionPhase;
 // Timeout constants
 // ---------------------------------------------------------------------------
 
+/// Default time allowed to receive complete request headers.
+pub const TIMEOUT_HEADERS_CONST: Duration = Duration::from_secs(30);
+
 /// Time allowed to receive complete request headers.
-pub const TIMEOUT_HEADERS: Duration = Duration::from_secs(30);
+///
+/// Can be overridden via `TIMEOUT_HEADERS_SECS` environment variable (for tests).
+pub fn get_timeout_headers() -> Duration {
+    std::env::var("TIMEOUT_HEADERS_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(TIMEOUT_HEADERS_CONST)
+}
+
+/// Deprecated: use `get_timeout_headers()` instead. Public for backward compat.
+#[allow(dead_code)]
+pub const TIMEOUT_HEADERS: Duration = TIMEOUT_HEADERS_CONST;
 
 /// Time allowed to receive the complete request body (fixed-length or chunked).
 pub const TIMEOUT_BODY: Duration = Duration::from_secs(60);
@@ -67,7 +82,7 @@ pub enum TimeoutClass {
 pub fn timeout_for_phase(phase: &ConnectionPhase) -> Option<(Duration, TimeoutClass)> {
     match phase {
         ConnectionPhase::ReadingHeaders => {
-            Some((TIMEOUT_HEADERS, TimeoutClass::RequestTimeout))
+            Some((get_timeout_headers(), TimeoutClass::RequestTimeout))
         }
         ConnectionPhase::ReadingBody { .. }
         | ConnectionPhase::ReadingChunked { .. } => {
@@ -130,7 +145,8 @@ mod tests {
     fn reading_headers_is_request_timeout() {
         let (dur, class) = timeout_for_phase(&ConnectionPhase::ReadingHeaders).unwrap();
         assert_eq!(class, TimeoutClass::RequestTimeout);
-        assert_eq!(dur,   TIMEOUT_HEADERS);
+        // Use the constant since get_timeout_headers() may be env-var overridden.
+        assert_eq!(dur,   TIMEOUT_HEADERS_CONST);
     }
 
     #[test]
@@ -231,5 +247,102 @@ mod tests {
                 .unwrap_or_else(|| panic!("no timeout for {phase:?}"));
             assert!(dur.as_millis() > 0, "zero timeout for {phase:?}");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Per-phase response content verification
+    // ------------------------------------------------------------------
+
+    /// Every phase that can be timed out must map to a canned response with
+    // the correct HTTP status line and body.
+    #[test]
+    fn phases_timed_out_with_408_send_correct_response() {
+        for phase in [
+            ConnectionPhase::ReadingHeaders,
+            ConnectionPhase::ReadingBody    { expected: 10 },
+            ConnectionPhase::ReadingChunked { assembled: vec![] },
+        ] {
+            let (dur, class) = timeout_for_phase(&phase)
+                .unwrap_or_else(|| panic!("no timeout for {phase:?}"));
+            assert!(dur.as_secs() > 0, "positive timeout for {phase:?}");
+
+            let resp = canned_response(class);
+            let s      = std::str::from_utf8(resp).expect("408 must be valid UTF-8");
+            assert!(s.starts_with("HTTP/1.1 408"), "phase {:?} should yield 408 but got: {}", phase, s.lines().next().unwrap_or("(empty)"));
+        }
+    }
+
+    #[test]
+    fn phases_timed_out_with_504_send_correct_response() {
+        for phase in [
+            ConnectionPhase::Processing,
+            ConnectionPhase::WritingResponse  { bytes_written: 0 },
+            ConnectionPhase::AwaitingCgi,
+        ] {
+            let (dur, class) = timeout_for_phase(&phase)
+                .unwrap_or_else(|| panic!("no timeout for {phase:?}"));
+            assert!(dur.as_secs() > 0, "positive timeout for {phase:?}");
+
+            let resp = canned_response(class);
+            let s      = std::str::from_utf8(resp).expect("504 must be valid UTF-8");
+            assert!(s.starts_with("HTTP/1.1 504"), "phase {:?} should yield 504 but got: {}", phase, s.lines().next().unwrap_or("(empty)"));
+        }
+    }
+
+    #[test]
+    fn done_phase_never_times_out() {
+        assert!(timeout_for_phase(&ConnectionPhase::Done).is_none(), "Done must never time out");
+
+        // Even with a zero timeout, Done is not timed out (no entry in map).
+        let resp = canned_response(TimeoutClass::GatewayTimeout);
+        assert!(resp.starts_with(b"HTTP/1.1 504"), "canned 504 must start correctly");
+    }
+
+    #[test]
+    fn all_timeout_responses_have_matching_content_length() {
+        // 408: verify body length matches the Content-Length header value.
+        let raw = RESPONSE_408;
+        let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let cl_header = std::str::from_utf8(&raw[..sep]).unwrap()
+            .lines().find(|l| l.to_lowercase().starts_with("content-length:"))
+            .expect("408 must have Content-Length header");
+        let cl: usize = cl_header.split(':').nth(1).unwrap().trim().parse().unwrap();
+        assert_eq!(cl, raw.len() - sep - 4, "408 Content-Length must match actual body length");
+
+        // 504: same check.
+        let raw = RESPONSE_504;
+        let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let cl_header = std::str::from_utf8(&raw[..sep]).unwrap()
+            .lines().find(|l| l.to_lowercase().starts_with("content-length:"))
+            .expect("504 must have Content-Length header");
+        let cl: usize = cl_header.split(':').nth(1).unwrap().trim().parse().unwrap();
+        assert_eq!(cl, raw.len() - sep - 4, "504 Content-Length must match actual body length");
+    }
+
+    #[test]
+    fn all_timeout_responses_close_connection() {
+        for class in [TimeoutClass::RequestTimeout, TimeoutClass::GatewayTimeout] {
+            let resp = canned_response(class);
+            let s = std::str::from_utf8(resp).expect("response must be valid UTF-8");
+            assert!(s.contains("\r\nConnection: close\r\n"),
+                    "timeout response {:?} must include Connection: close", class);
+        }
+    }
+
+    #[test]
+    fn timeout_constants_have_reasonable_durations() {
+        // Reading headers should timeout fastest (slowloris defense).
+        assert!(TIMEOUT_HEADERS.as_secs() <= 45, "headers timeout should be ≤45s");
+
+        // Body / write timeouts can be longer for uploads.
+        assert!(TIMEOUT_BODY.as_secs() >= 30, "body timeout should be ≥30s");
+        assert!(TIMEOUT_WRITE.as_secs() >= 30, "write timeout should be ≥30s");
+
+        // Processing is a safety net; shouldn't be excessive.
+        assert!(TIMEOUT_PROCESSING.as_secs() <= 10, "processing timeout should be ≤10s");
+
+        // CGI scripts should not run indefinitely.
+        assert!(TIMEOUT_CGI.as_secs() >= 15 && TIMEOUT_CGI.as_secs() <= 60,
+                "CGI timeout should be between 15s and 60s");
     }
 }

@@ -489,4 +489,75 @@ mod tests {
         assert!(matches!(accept_one(fd), AcceptResult::WouldBlock));
         unsafe { libc::close(fd) };
     }
+
+    // ---- multi-port / multi-server binding ----------------------------------
+
+    #[test]
+    fn bind_multiple_ports_from_single_server() {
+        // A single server block with multiple ports must bind to ALL of them.
+        let mut config = test_server("127.0.0.1", 17894);
+        config.ports = vec![17894, 17895, 17896];
+
+        let epoll   = Epoll::create().unwrap();
+        let mut reg = Registry::new();
+        let result  = bind_listeners(&[config], &epoll, &mut reg);
+
+        // Clean up regardless.
+        if let Ok(ref bound) = result {
+            for &(fd, _) in bound {
+                unsafe { libc::close(fd) };
+            }
+        }
+        assert!(result.is_ok(), "multi-port bind failed: {:?}", result.err());
+
+        let bound = result.unwrap();
+        assert_eq!(bound.len(), 3,
+            "expected 3 sockets for 3 ports, got {}", bound.len());
+
+        // Each listener must be registered in the registry.
+        assert_eq!(reg.listener_count(), 3);
+
+        // Verify each reported address is one of our configured ports.
+        let found_ports: std::collections::HashSet<u16> = bound
+            .iter()
+            .map(|(_, addr)| addr.port())
+            .collect();
+        assert_eq!(found_ports, std::collections::HashSet::from([17894, 17895, 17896]),
+            "reported ports mismatch");
+    }
+
+    #[test]
+    fn bind_multiple_server_blocks_independently() {
+        // Two separate server blocks with different host:port pairs must both
+        // bind successfully and remain independent.
+        let mut config_a = test_server("127.0.0.1", 17897);
+        config_a.server_names = vec!["alpha.local".into()];
+
+        let mut config_b = test_server("127.0.0.1", 17898);
+        config_b.server_names = vec!["beta.local".into()];
+
+        let epoll   = Epoll::create().unwrap();
+        let mut reg = Registry::new();
+        let configs = vec![config_a, config_b];
+        let result  = bind_listeners(&configs, &epoll, &mut reg);
+
+        // Clean up regardless.
+        if let Ok(ref bound) = result {
+            for &(fd, _) in bound {
+                unsafe { libc::close(fd) };
+            }
+        }
+        assert!(result.is_ok(), "multi-server bind failed: {:?}", result.err());
+
+        let bound = result.unwrap();
+        assert_eq!(bound.len(), 2,
+            "expected 2 sockets for 2 servers, got {}", bound.len());
+
+        assert_eq!(reg.listener_count(), 2);
+
+        // Each server must have exactly one entry in the registry.
+        for (fd, _) in &bound {
+            assert!(reg.is_listener(*fd), "fd {} should be registered as a listener", fd);
+        }
+    }
 }
