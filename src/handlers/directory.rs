@@ -5,45 +5,17 @@
 /// so it can be called directly and tested independently.
 use std::path::Path;
 
-use crate::config::types::RouteConfig;
-use crate::http::request::types::Request;
 use crate::http::response::{builder, types::Response};
-use crate::utils::path as pathutil;
 
 // ---------------------------------------------------------------------------
-// Public entry point
+// Public entry point (called directly by static_file handler)
 // ---------------------------------------------------------------------------
 
-/// Serve an HTML directory listing for the path resolved from `request`.
-///
-/// Returns:
-/// - `200 OK` with an HTML body listing directory entries.
-/// - `403 Forbidden` if listing is disabled or a permission error occurs.
-/// - `404 Not Found` if the directory does not exist.
-pub fn serve(request: &Request, route: &RouteConfig) -> Response {
-    if !route.directory_listing {
-        return builder::forbidden(None);
-    }
-
-    let root = match &route.root {
-        Some(r) => r.as_str(),
-        None    => return builder::not_found(None),
-    };
-
-    let fs_path = match pathutil::resolve_safe(root, &request.path) {
-        Ok(p)  => p,
-        Err(_) => return builder::not_found(None),
-    };
-
-    if !fs_path.is_dir() {
-        return builder::not_found(None);
-    }
-
-    render_listing(&fs_path, &request.path)
-}
-
-// ---------------------------------------------------------------------------
-// HTML rendering
+/// Render an HTML directory listing for `dir`.
+/// `url_path` is used in the page title and breadcrumb.
+//
+// Note: the former `serve()` wrapper was removed — it duplicated exactly what
+// `static_file::serve_path()` already does (path resolution + listing check).
 // ---------------------------------------------------------------------------
 
 /// Generate the HTML listing body for `dir`.
@@ -178,8 +150,6 @@ fn html_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::types::RouteConfig;
-    use crate::http::request::types::{HeaderMap, Method, Request, Version};
     use std::fs;
 
     fn tmp_dir() -> String {
@@ -188,45 +158,13 @@ mod tests {
         dir
     }
 
-    fn get_req(path: &str) -> Request {
-        Request {
-            method:  Method::Get,
-            path:    path.into(),
-            query:   String::new(),
-            version: Version::Http11,
-            headers: HeaderMap::new(),
-            body:    Vec::new(),
-        }
-    }
-
-    fn listing_route(root: &str) -> RouteConfig {
-        RouteConfig {
-            path:              "/".into(),
-            root:              Some(root.into()),
-            directory_listing: true,
-            ..Default::default()
-        }
-    }
-
-    // ---- serve -------------------------------------------------------------
-
-    #[test]
-    fn listing_disabled_returns_403() {
-        let dir   = tmp_dir();
-        let route = RouteConfig {
-            path: "/".into(), root: Some(dir.clone()), directory_listing: false,
-            ..Default::default()
-        };
-        let resp = serve(&get_req("/"), &route);
-        assert_eq!(resp.status.code(), 403);
-        fs::remove_dir_all(&dir).ok();
-    }
+    // ---- render_listing ----------------------------------------------------
 
     #[test]
     fn listing_returns_200_with_html() {
         let dir = tmp_dir();
         fs::write(format!("{dir}/a.txt"), b"").unwrap();
-        let resp = serve(&get_req("/"), &listing_route(&dir));
+        let resp = render_listing(Path::new(&dir), "/");
         assert_eq!(resp.status.code(), 200);
         let body = String::from_utf8_lossy(&resp.body);
         assert!(body.contains("a.txt"));
@@ -239,7 +177,7 @@ mod tests {
         let dir = tmp_dir();
         fs::create_dir(format!("{dir}/zzz_dir")).unwrap();
         fs::write(format!("{dir}/aaa.txt"), b"").unwrap();
-        let resp = serve(&get_req("/"), &listing_route(&dir));
+        let resp = render_listing(Path::new(&dir), "/");
         let body = String::from_utf8_lossy(&resp.body);
         let dir_pos  = body.find("zzz_dir").unwrap();
         let file_pos = body.find("aaa.txt").unwrap();
@@ -252,7 +190,7 @@ mod tests {
         let dir = tmp_dir();
         // The subdir must exist on disk for resolve_safe to succeed.
         fs::create_dir(format!("{dir}/subdir")).unwrap();
-        let resp = serve(&get_req("/subdir"), &listing_route(&dir));
+        let resp = render_listing(Path::new(&dir), "/subdir");
         let body = String::from_utf8_lossy(&resp.body);
         assert!(body.contains("../"));
         fs::remove_dir_all(&dir).ok();
@@ -261,7 +199,7 @@ mod tests {
     #[test]
     fn no_parent_link_at_root() {
         let dir  = tmp_dir();
-        let resp = serve(&get_req("/"), &listing_route(&dir));
+        let resp = render_listing(Path::new(&dir), "/");
         let body = String::from_utf8_lossy(&resp.body);
         assert!(!body.contains("href=\"../\""), "root should have no ../ link");
         fs::remove_dir_all(&dir).ok();
@@ -284,15 +222,5 @@ mod tests {
         assert_eq!(format_size(1024),          "1.0 KiB");
         assert_eq!(format_size(1024 * 1024),   "1.0 MiB");
         assert_eq!(format_size(1024 * 1024 * 1024), "1.0 GiB");
-    }
-
-    // ---- traversal ---------------------------------------------------------
-
-    #[test]
-    fn traversal_in_listing_returns_404() {
-        let dir  = tmp_dir();
-        let resp = serve(&get_req("/../etc"), &listing_route(&dir));
-        assert_eq!(resp.status.code(), 404);
-        fs::remove_dir_all(&dir).ok();
     }
 }

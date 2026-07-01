@@ -198,8 +198,7 @@ fn check_cgi_interpreters(configs: &[ServerConfig]) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::types::{Method, Redirect, RouteConfig, ServerConfig};
-    use std::collections::HashMap;
+    use crate::config::types::{ Redirect, RouteConfig, ServerConfig};
 
     fn minimal_server(host: &str, ports: &[u16]) -> ServerConfig {
         ServerConfig {

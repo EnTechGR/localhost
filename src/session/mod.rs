@@ -28,4 +28,4 @@ pub mod store;
 pub use cookie::{
     extract_session_id, parse_cookies, set_cookie_header, CookieOptions, SESSION_COOKIE,
 };
-pub use store::{SessionData, SessionId, SessionStore};
+pub use store::{SessionId, SessionStore};

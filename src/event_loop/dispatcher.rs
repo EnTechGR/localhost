@@ -25,6 +25,7 @@
 /// Connections idle for longer than `TIMEOUT_*` constants are closed, with a
 /// 408 response if headers were still being received.
 use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use libc::epoll_event;
 
@@ -41,6 +42,7 @@ use crate::server::listener::{accept_one, AcceptResult};
 use crate::server::timeout::{canned_response, timeout_for_phase, TimeoutClass};
 use crate::cgi::{self, io::{StdinOutcome, StdoutOutcome}};
 use crate::router::handler::DispatchOutcome;
+use crate::http::response::types::StatusCode;
 use crate::session::{self, SessionStore};
 
 /// How many events we ask `epoll_wait` to return per call.
@@ -63,13 +65,12 @@ const SESSION_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(3600
 // run()
 // ---------------------------------------------------------------------------
 
-/// Enter the event loop. Never returns under normal operation.
+/// Enter the event loop.
 ///
-/// Preconditions:
-/// - `epoll` has all listener fds registered with `EPOLLIN`.
-/// - `registry` has matching entries for every listener fd.
-/// - `configs` is indexed by the `server_id` stored in listener entries.
-pub fn run(epoll: Epoll, mut registry: Registry, configs: Vec<ServerConfig>) -> ! {
+/// Returns `0` on clean shutdown (signal received) or `1` if epoll itself
+/// failed irrecoverably.  Under normal operation this function never returns
+/// — but it will when a signal handler sets `shutdown_requested`.
+pub fn run(epoll: Epoll, mut registry: Registry, configs: Vec<ServerConfig>, shutdown_requested: &AtomicBool) -> i32 {
     let mut events: Vec<epoll_event> =
         vec![unsafe { std::mem::zeroed() }; MAX_EVENTS];
     let mut sessions = SessionStore::new();
@@ -115,6 +116,21 @@ pub fn run(epoll: Epoll, mut registry: Registry, configs: Vec<ServerConfig>) -> 
         check_timeouts(&mut registry, &epoll);
         sessions.purge_expired(SESSION_MAX_AGE);
         reap_children();
+
+        // Check for a signal-driven shutdown between ticks.
+        if shutdown_requested.load(Ordering::Relaxed) {
+            eprintln!("[INFO] Shutdown requested — draining listeners and connections");
+            let (listener_fds, conn_fds) = registry.drain_all();
+            for fd in listener_fds {
+                let _ = epoll.delete(fd);
+                unsafe { libc::close(fd) };
+            }
+            for fd in conn_fds {
+                let _ = epoll.delete(fd);
+                unsafe { libc::close(fd) };
+            }
+            return 0; // clean shutdown
+        }
     }
 }
 
@@ -391,7 +407,7 @@ fn finish_cgi(owner_fd: RawFd, epoll: &Epoll, registry: &mut Registry, force_err
         let body = b"<html><body><h1>502 Bad Gateway</h1>\
                      <p>The CGI script produced no valid response.</p>\
                      </body></html>".to_vec();
-        crate::http::response::builder::error(502, body)
+        crate::http::response::builder::error(StatusCode::BAD_GATEWAY, body)
     } else {
         cgi::build_response(std::mem::take(&mut process.out_buf))
     };
@@ -607,7 +623,8 @@ fn advance_connection(conn: &mut ConnectionState, configs: &[ServerConfig], sess
                     ParseResult::Incomplete => return Transition::NeedMoreData,
                     ParseResult::Error(e) => {
                         eprintln!("[WARN] parse error fd={}: {e}", conn.fd);
-                        conn.set_response(HTTP_400.to_vec());
+                        let resp = crate::http::response::builder::error(StatusCode::BAD_REQUEST, b"Bad Request".to_vec());
+                        conn.set_response(crate::http::response::writer::serialize(&resp));
                         return Transition::ResponseReady;
                     }
                     ParseResult::Complete(req, consumed) => {
@@ -639,9 +656,16 @@ fn advance_connection(conn: &mut ConnectionState, configs: &[ServerConfig], sess
             ConnectionPhase::ReadingBody { expected, .. } => {
                 let expected = *expected;
                 match read_body_unchunked(&conn.read_buf, expected) {
-                    BodyResult::NeedsMore { .. } => return Transition::NeedMoreData,
+                    BodyResult::NeedsMore { have, need } => {
+                        eprintln!(
+                            "[DEBUG] body read on fd={}: have {have} bytes, need {need}",
+                            conn.fd
+                        );
+                        return Transition::NeedMoreData;
+                    }
                     BodyResult::Complete(body) => {
-                        conn.complete_body(body);
+                        // `expected` is the Content-Length = consumed bytes.
+                        conn.complete_body(body, expected);
                         return process_request(conn, configs, sessions);
                     }
                 }
@@ -653,11 +677,17 @@ fn advance_connection(conn: &mut ConnectionState, configs: &[ServerConfig], sess
                     ChunkedResult::NeedsMore => return Transition::NeedMoreData,
                     ChunkedResult::Error(e) => {
                         eprintln!("[WARN] chunked decode error fd={}: {e}", conn.fd);
-                        conn.set_response(HTTP_400.to_vec());
+                        let resp = crate::http::response::builder::error(StatusCode::BAD_REQUEST, b"Bad Request".to_vec());
+                        conn.set_response(crate::http::response::writer::serialize(&resp));
                         return Transition::ResponseReady;
                     }
-                    ChunkedResult::Complete(body, _) => {
-                        conn.complete_body(body);
+                    ChunkedResult::Complete(body, consumed) => {
+                        eprintln!(
+                            "[DEBUG] chunked body on fd={}: {consumed} wire bytes assembled to {} bytes",
+                            conn.fd,
+                            body.len()
+                        );
+                        conn.complete_body(body, consumed);
                         return process_request(conn, configs, sessions);
                     }
                 }
@@ -678,17 +708,41 @@ fn process_request(
     sessions: &mut SessionStore,
 ) -> Transition {
     if configs.is_empty() {
-        conn.set_response(HTTP_500.to_vec());
+        let resp = crate::http::response::builder::error(StatusCode::INTERNAL_SERVER_ERROR, b"Internal Server Error".to_vec());
+        conn.set_response(crate::http::response::writer::serialize(&resp));
         return Transition::ResponseReady;
     }
 
     let req = match conn.request.take() {
         Some(r) => r,
         None => {
-            conn.set_response(HTTP_500.to_vec());
+            let resp = crate::http::response::builder::error(StatusCode::INTERNAL_SERVER_ERROR, b"Internal Server Error".to_vec());
+            conn.set_response(crate::http::response::writer::serialize(&resp));
             return Transition::ResponseReady;
         }
     };
+
+    // ------------------------------------------------------------------
+    // Header validation (RFC 7230 §5.4): Host is required for HTTP/1.1
+    // ------------------------------------------------------------------
+    if req.is_headerless() {
+        eprintln!("[WARN] headerless request from {}", conn.peer_addr);
+        let body = b"<html><body><h1>400 Bad Request</h1>\
+                     <p>A Host header is required.</p></body></html>"
+            .to_vec();
+        let resp = crate::http::response::builder::error(StatusCode::BAD_REQUEST, body);
+        conn.set_response(serialize(&resp));
+        return Transition::ResponseReady;
+    }
+    if !req.has_header("host") {
+        eprintln!("[WARN] missing Host header from {}", conn.peer_addr);
+        let body = b"<html><body><h1>400 Bad Request</h1>\
+                     <p>A Host header is required by HTTP/1.1.</p></body></html>"
+            .to_vec();
+        let resp = crate::http::response::builder::error(StatusCode::BAD_REQUEST, body);
+        conn.set_response(serialize(&resp));
+        return Transition::ResponseReady;
+    }
 
     // ------------------------------------------------------------------
     // Session resolution: reuse the cookie's session if it still exists,
@@ -698,20 +752,78 @@ fn process_request(
     // ------------------------------------------------------------------
     let existing_id = req.headers.get("cookie").and_then(|header| {
         let cookies = session::parse_cookies(header);
-        session::extract_session_id(&cookies).map(str::to_string)
+        session::extract_session_id(&cookies).map(String::from)
     });
 
     match existing_id {
-        Some(id) if sessions.get_mut(&id).is_some() => {
+        Some(ref id) if sessions.get_mut(id).is_some() => {
             // Known session, already touched by get_mut. Nothing to send.
         }
         _ => {
             let id = sessions.create();
-            conn.pending_session_cookie = Some(id);
+            conn.pending_session_cookie = Some(id.clone());
         }
+    }
+    if let Some(ref sid) = existing_id {
+        conn.active_session_id = Some(sid.clone());
     }
 
     let server = select_server(req.host(), conn.local_port, configs);
+
+    // ------------------------------------------------------------------
+    // Special handling: /logout route — destroy session and clear cookie.
+    // This bypasses normal routing since the session must be torn down first.
+    // ------------------------------------------------------------------
+    if req.path == "/logout" && req.method == crate::config::types::Method::Post {
+        if let Some(ref sid) = conn.active_session_id {
+            sessions.destroy(sid);
+        }
+        conn.active_session_id = None;
+        // Send a cleared session cookie (expired max-age) so the client removes it.
+        let cleared = session::set_cookie_header(
+            session::SESSION_COOKIE,
+            "",
+            &session::CookieOptions {
+                max_age: Some(0),
+                ..session::CookieOptions::default()
+            },
+        );
+        let mut resp = crate::http::response::builder::ok(b"Logged out.".to_vec(), "text/plain");
+        resp.headers.append("Set-Cookie", cleared);
+        let bytes = serialize(&resp);
+        conn.set_response(bytes);
+        return Transition::ResponseReady;
+    }
+
+    // ------------------------------------------------------------------
+    // Special handling: /login route — store credentials in session.
+    // Expects query params ?username=foo&password=bar (POST).
+    // In production you'd hash the password, validate against a DB, etc.
+    // ------------------------------------------------------------------
+    if req.path == "/login" && req.method == crate::config::types::Method::Post {
+        let body = String::from_utf8_lossy(&req.body);
+        let params: Vec<(&str, &str)> = body.split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .collect();
+        let username = params.iter()
+            .find(|(k, _)| *k == "username")
+            .map(|(_, v)| *v);
+        if let Some(user) = username {
+            // Store user data in session.
+            if let Some(ref sid) = conn.active_session_id {
+                if let Some(sess) = sessions.get_mut(sid) {
+                    sess.values.insert("user".to_string(), user.to_string());
+                }
+            }
+        }
+        let mut resp = crate::http::response::builder::ok(b"Logged in.".to_vec(), "text/plain");
+        if !conn.keep_alive {
+            resp.headers.set("Connection", "close");
+        }
+        let bytes = serialize(&resp);
+        conn.set_response(bytes);
+        return Transition::ResponseReady;
+    }
 
     let route = match match_route(&req.path, &server.routes) {
         Some(r) => r,
@@ -729,7 +841,7 @@ fn process_request(
         }
     };
 
-    match dispatch(&req, route, server) {
+    match dispatch(&req, route, server, conn.active_session_id.as_deref()) {
         DispatchOutcome::Response(mut response) => {
             attach_pending_cookie(conn, &mut response);
             if !conn.keep_alive {
@@ -753,17 +865,15 @@ fn process_request(
                     let stdout_fd = process.stdout_fd;
                     let stdin_fd  = process.stdin_fd;
 
-                    conn.phase = ConnectionPhase::AwaitingCgi {
-                        child_pid: process.pid,
-                        pipe_fd:   stdout_fd,
-                    };
+                    conn.phase = ConnectionPhase::AwaitingCgi;
                     conn.cgi = Some(process);
 
                     Transition::CgiStarted { stdout_fd, stdin_fd }
                 }
                 Err(e) => {
                     eprintln!("[WARN] CGI spawn failed: {e}");
-                    conn.set_response(HTTP_502.to_vec());
+                    let resp = crate::http::response::builder::error(StatusCode::BAD_GATEWAY, b"Bad Gateway".to_vec());
+                    conn.set_response(crate::http::response::writer::serialize(&resp));
                     Transition::ResponseReady
                 }
             }
@@ -822,34 +932,6 @@ fn flush_write_buf(fd: RawFd, conn: &mut ConnectionState) -> FlushResult {
         FlushResult::Error(-1)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Canned HTTP error responses (static byte strings)
-// ---------------------------------------------------------------------------
-
-const HTTP_400: &[u8] = b"\
-HTTP/1.1 400 Bad Request\r\n\
-Content-Type: text/plain\r\n\
-Content-Length: 11\r\n\
-Connection: close\r\n\
-\r\n\
-Bad Request";
-
-const HTTP_500: &[u8] = b"\
-HTTP/1.1 500 Internal Server Error\r\n\
-Content-Type: text/plain\r\n\
-Content-Length: 21\r\n\
-Connection: close\r\n\
-\r\n\
-Internal Server Error";
-
-const HTTP_502: &[u8] = b"\
-HTTP/1.1 502 Bad Gateway\r\n\
-Content-Type: text/html; charset=utf-8\r\n\
-Content-Length: 98\r\n\
-Connection: close\r\n\
-\r\n\
-<html><head><title>502 Bad Gateway</title></head><body><h1>502 Bad Gateway</h1></body></html>";
 
 /// Reap all finished child processes (CGI) to prevent zombies.
 ///

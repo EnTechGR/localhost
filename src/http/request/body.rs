@@ -27,6 +27,7 @@ pub enum BodyResult {
     /// Returns the body bytes (a slice of `buf`).
     Complete(Vec<u8>),
     /// `buf` has fewer bytes than `content_length`. Accumulate more.
+    /// The `have`/`need` fields are useful for error reporting and progress tracking.
     NeedsMore { have: usize, need: usize },
 }
 
@@ -52,9 +53,8 @@ pub fn read_body_unchunked(buf: &[u8], content_length: usize) -> BodyResult {
 /// Result of attempting to decode a chunked body.
 #[derive(Debug)]
 pub enum ChunkedResult {
-    /// All chunks decoded; returns the fully assembled body.
-    /// The associated `usize` is how many bytes of `buf` were consumed
-    /// (including the final `0\r\n\r\n` terminator).
+    /// All chunks decoded; returns the fully assembled body and how many bytes
+    /// of `buf` were consumed (including the final `0\r\n\r\n` terminator).
     Complete(Vec<u8>, usize),
     /// More data needed before decoding can complete.
     NeedsMore,

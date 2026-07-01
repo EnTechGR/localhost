@@ -26,7 +26,6 @@ use std::path::Path;
 use crate::config::types::RouteConfig;
 use crate::http::request::types::Request;
 use crate::http::response::{builder, types::Response};
-use crate::http::response::types::StatusCode;
 use crate::utils::path as pathutil;
 
 // ---------------------------------------------------------------------------
@@ -104,7 +103,7 @@ fn conflict_response() -> Response {
                  <body><h1>409 Conflict</h1>\
                  <p>Cannot delete a non-empty directory.</p>\
                  </body></html>".to_vec();
-    let mut resp = builder::error(409, body);
+    let resp = builder::error(crate::http::response::types::StatusCode::CONFLICT, body);
     resp
 }
 

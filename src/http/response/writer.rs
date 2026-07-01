@@ -5,7 +5,7 @@
 /// reports whether the write completed or needs to be resumed.
 use std::os::unix::io::RawFd;
 
-use crate::http::response::types::{Response, StatusCode};
+use crate::http::response::types::{Response};
 
 // ---------------------------------------------------------------------------
 // WriteResult
@@ -193,7 +193,7 @@ fn rfc7231_date() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::response::types::{Response, ResponseHeaders, StatusCode};
+    use crate::http::response::types::{Response, StatusCode};
 
     fn simple_ok(body: &[u8]) -> Response {
         let mut resp = Response::new(StatusCode::OK);

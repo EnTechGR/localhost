@@ -40,11 +40,10 @@ pub mod io;
 
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
-use std::time::Instant;
 
 use crate::config::types::RouteConfig;
 use crate::http::request::types::Request;
-use crate::http::response::{builder, types::Response};
+use crate::http::response::{builder, types::{Response, StatusCode}};
 
 // ---------------------------------------------------------------------------
 // CgiTarget
@@ -91,10 +90,6 @@ pub struct CgiProcess {
 
     /// Raw CGI output accumulated from stdout (headers + body, unparsed).
     pub out_buf: Vec<u8>,
-
-    /// When the child was spawned (the timeout module measures from here via
-    /// the connection's `last_activity`, but this is kept for diagnostics).
-    pub started: Instant,
 }
 
 impl CgiProcess {
@@ -158,7 +153,7 @@ pub fn build_response(out_buf: Vec<u8>) -> Response {
                          <p>The CGI script produced no valid response.</p>\
                          </body></html>"
                 .to_vec();
-            builder::error(502, body)
+            builder::error(StatusCode::BAD_GATEWAY, body)
         }
     }
 }

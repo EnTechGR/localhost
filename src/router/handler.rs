@@ -9,7 +9,7 @@
 /// 5. Method-specific handler (static file / upload / delete)
 use crate::config::types::{RouteConfig, ServerConfig};
 use crate::http::request::types::Request;
-use crate::http::response::{builder, types::Response};
+use crate::http::response::{builder, types::{Response, StatusCode}};
 use crate::config::types::Method;
 use crate::handlers::{delete, redirect as redirect_handler, static_file, upload};
 use crate::cgi::{self, CgiTarget};
@@ -43,12 +43,17 @@ impl DispatchOutcome {
 
 /// Dispatch `request` to the appropriate handler and return a `Response`.
 ///
+/// `active_session_id` is the resolved session for this request (set by the
+/// dispatcher during cookie resolution). Handlers use it to store/retrieve
+/// per-session data via [`crate::session::store::SessionStore`].
+///
 /// This function is synchronous and infallible: every code path returns a
 /// valid `Response`.
 pub fn dispatch(
-    request: &Request,
-    route:   &RouteConfig,
-    server:  &ServerConfig,
+    request:           &Request,
+    route:             &RouteConfig,
+    server:            &ServerConfig,
+    _active_session_id: Option<&str>,
 ) -> DispatchOutcome {
     // ------------------------------------------------------------------
     // 1. Method check
@@ -61,7 +66,7 @@ pub fn dispatch(
     // 2. Redirect
     // ------------------------------------------------------------------
     if let Some(redir) = &route.redirect {
-        return DispatchOutcome::Response(redirect_handler::redirect(redir.code, &redir.target));
+        return DispatchOutcome::Response(redirect_handler::redirect(StatusCode(redir.code), &redir.target));
     }
 
     // ------------------------------------------------------------------
@@ -209,7 +214,7 @@ mod tests {
         let route = route_get_only(&dir);
         let req   = Request { method: Method::Post, ..get("/") };
         
-        let resp  = dispatch(&req, &route, &server()).unwrap_response();
+        let resp  = dispatch(&req, &route, &server(), None).unwrap_response();
         fs::remove_dir_all(&dir).ok();
         assert_eq!(resp.status.code(), 405);
         assert!(resp.headers.get("Allow").is_some());
@@ -225,7 +230,7 @@ mod tests {
             redirect: Some(Redirect { code: 301, target: "/new".into() }),
             ..Default::default()
         };
-        let resp = dispatch(&get("/old"), &route, &server()).unwrap_response();
+        let resp = dispatch(&get("/old"), &route, &server(), None).unwrap_response();
         assert_eq!(resp.status.code(), 301);
         assert_eq!(resp.headers.get("Location"), Some("/new"));
     }
@@ -237,7 +242,7 @@ mod tests {
         let dir = tmp_dir();
         fs::write(format!("{dir}/hello.txt"), b"world").unwrap();
         let route = open_route(&dir);
-        let resp  = dispatch(&get("/hello.txt"), &route, &server()).unwrap_response();
+        let resp  = dispatch(&get("/hello.txt"), &route, &server(), None).unwrap_response();
         fs::remove_dir_all(&dir).ok();
         assert_eq!(resp.status.code(), 200);
         assert_eq!(resp.body, b"world");
@@ -249,7 +254,7 @@ mod tests {
         fs::write(format!("{dir}/data.txt"), b"12345").unwrap();
         let route = open_route(&dir);
         let req   = Request { method: Method::Head, ..get("/data.txt") };
-        let resp  = dispatch(&req, &route, &server()).unwrap_response();
+        let resp  = dispatch(&req, &route, &server(), None).unwrap_response();
         fs::remove_dir_all(&dir).ok();
         assert_eq!(resp.status.code(), 200);
         assert!(resp.body.is_empty(), "HEAD must have no body");
@@ -266,7 +271,7 @@ mod tests {
         let mut req = get("/");
         req.method = Method::Post;
         req.body   = b"toolong".to_vec();
-        let resp = dispatch(&req, &route, &server()).unwrap_response();
+        let resp = dispatch(&req, &route, &server(), None).unwrap_response();
         fs::remove_dir_all(&dir).ok();
         assert_eq!(resp.status.code(), 413);
     }
@@ -278,7 +283,7 @@ mod tests {
         let dir = tmp_dir();
         let route = open_route(&dir);
         let req = Request { method: Method::Options, ..get("/") };
-        let resp = dispatch(&req, &route, &server()).unwrap_response();
+        let resp = dispatch(&req, &route, &server(), None).unwrap_response();
         fs::remove_dir_all(&dir).ok();
         assert_eq!(resp.status.code(), 204);
         assert!(resp.headers.get("Allow").is_some());

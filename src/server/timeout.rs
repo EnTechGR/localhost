@@ -125,7 +125,6 @@ pub fn canned_response(class: TimeoutClass) -> &'static [u8] {
 mod tests {
     use super::*;
     use crate::server::connection::ConnectionPhase;
-    use std::os::unix::io::RawFd;
 
     #[test]
     fn reading_headers_is_request_timeout() {
@@ -137,7 +136,7 @@ mod tests {
     #[test]
     fn reading_body_is_request_timeout() {
         let (dur, class) = timeout_for_phase(&ConnectionPhase::ReadingBody {
-            expected: 100, bytes_read: 0,
+            expected: 100,
         }).unwrap();
         assert_eq!(class, TimeoutClass::RequestTimeout);
         assert_eq!(dur,   TIMEOUT_BODY);
@@ -162,10 +161,7 @@ mod tests {
 
     #[test]
     fn awaiting_cgi_is_gateway_timeout() {
-        let (dur, class) = timeout_for_phase(&ConnectionPhase::AwaitingCgi {
-            child_pid: 0,
-            pipe_fd:   0 as RawFd,
-        }).unwrap();
+        let (dur, class) = timeout_for_phase(&ConnectionPhase::AwaitingCgi).unwrap();
         assert_eq!(class, TimeoutClass::GatewayTimeout);
         assert_eq!(dur,   TIMEOUT_CGI);
     }
@@ -224,11 +220,11 @@ mod tests {
     fn all_non_done_phases_have_positive_timeouts() {
         let phases = vec![
             ConnectionPhase::ReadingHeaders,
-            ConnectionPhase::ReadingBody    { expected: 10, bytes_read: 0 },
+            ConnectionPhase::ReadingBody    { expected: 10 },
             ConnectionPhase::ReadingChunked { assembled: vec![] },
             ConnectionPhase::Processing,
             ConnectionPhase::WritingResponse { bytes_written: 0 },
-            ConnectionPhase::AwaitingCgi    { child_pid: 0, pipe_fd: 0 },
+            ConnectionPhase::AwaitingCgi,
         ];
         for phase in &phases {
             let (dur, _) = timeout_for_phase(phase)

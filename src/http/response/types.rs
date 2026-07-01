@@ -12,8 +12,11 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatusCode(pub u16);
 
+#[allow(dead_code)]
 impl StatusCode {
-    // 2xx
+    /// All constants are part of the public API surface for consumers to
+    /// compare against status codes returned by handlers, and internally they
+    /// replace raw integer literals throughout the codebase.
     pub const OK:                    StatusCode = StatusCode(200);
     pub const CREATED:               StatusCode = StatusCode(201);
     pub const NO_CONTENT:            StatusCode = StatusCode(204);
@@ -27,15 +30,16 @@ impl StatusCode {
     pub const FORBIDDEN:             StatusCode = StatusCode(403);
     pub const NOT_FOUND:             StatusCode = StatusCode(404);
     pub const METHOD_NOT_ALLOWED:    StatusCode = StatusCode(405);
+    pub const CONFLICT:              StatusCode = StatusCode(409);
     pub const REQUEST_TIMEOUT:       StatusCode = StatusCode(408);
     pub const PAYLOAD_TOO_LARGE:     StatusCode = StatusCode(413);
     pub const URI_TOO_LONG:          StatusCode = StatusCode(414);
-    pub const IM_A_TEAPOT:           StatusCode = StatusCode(418);
     // 5xx
     pub const INTERNAL_SERVER_ERROR: StatusCode = StatusCode(500);
     pub const BAD_GATEWAY:           StatusCode = StatusCode(502);
     pub const GATEWAY_TIMEOUT:       StatusCode = StatusCode(504);
 
+    /// Extract the raw u16 status code value.
     pub fn code(self) -> u16 { self.0 }
 
     /// Standard reason phrase for well-known codes.
@@ -52,10 +56,10 @@ impl StatusCode {
             403 => "Forbidden",
             404 => "Not Found",
             405 => "Method Not Allowed",
+            409 => "Conflict",
             408 => "Request Timeout",
             413 => "Payload Too Large",
             414 => "URI Too Long",
-            418 => "I'm a teapot",
             500 => "Internal Server Error",
             502 => "Bad Gateway",
             504 => "Gateway Timeout",
@@ -124,13 +128,6 @@ impl ResponseHeaders {
         self.entries.iter().map(|(k, v)| (k.as_str(), v.as_str()))
     }
 
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -154,18 +151,6 @@ impl Response {
         }
     }
 
-    /// Convenience: create a response with a text body.
-    pub fn with_body(mut self, body: Vec<u8>, content_type: &str) -> Self {
-        self.headers.set("Content-Type",   content_type);
-        self.headers.set("Content-Length", body.len().to_string());
-        self.body = body;
-        self
-    }
-
-    /// True if this response may carry a body according to the HTTP spec.
-    pub fn may_have_body(&self) -> bool {
-        !self.status.must_not_have_body()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -203,7 +188,8 @@ mod tests {
         h.set("Content-Type", "text/plain");
         h.set("Content-Type", "text/html");
         assert_eq!(h.get("Content-Type"), Some("text/html"));
-        assert_eq!(h.len(), 1);
+        // Verify first entry was removed by checking the value changed.
+        assert_eq!(h.iter().count(), 1);
     }
 
     #[test]
@@ -211,7 +197,7 @@ mod tests {
         let mut h = ResponseHeaders::new();
         h.append("Set-Cookie", "a=1");
         h.append("Set-Cookie", "b=2");
-        assert_eq!(h.len(), 2);
+        assert_eq!(h.iter().count(), 2);
     }
 
     #[test]
@@ -223,9 +209,11 @@ mod tests {
     }
 
     #[test]
-    fn response_with_body_sets_length() {
-        let resp = Response::new(StatusCode::OK)
-            .with_body(b"hello".to_vec(), "text/plain");
+    fn response_can_be_constructed_with_body_directly() {
+        let mut resp = Response::new(StatusCode::OK);
+        resp.headers.set("Content-Type",   "text/plain");
+        resp.headers.set("Content-Length", "5");
+        resp.body = b"hello".to_vec();
         assert_eq!(resp.headers.get("Content-Length"), Some("5"));
         assert_eq!(resp.body, b"hello");
     }

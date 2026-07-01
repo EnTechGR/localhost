@@ -25,7 +25,6 @@
 use std::ffi::CString;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
-use std::time::Instant;
 
 use crate::cgi::{env, CgiProcess, CgiTarget};
 use crate::config::types::ServerConfig;
@@ -157,7 +156,6 @@ pub fn spawn(
         body: req.body.clone(),
         body_cursor: 0,
         out_buf: Vec::new(),
-        started: Instant::now(),
     })
 }
 

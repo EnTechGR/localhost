@@ -91,9 +91,7 @@ impl Registry {
         self.listeners.iter().map(|(&fd, e)| (fd, e))
     }
 
-    /// Remove a listener entry. Symmetric counterpart to `register_listener`,
-    /// reserved for a graceful-shutdown path that is not yet wired.
-    #[allow(dead_code)]
+    /// Remove a listener entry. Symmetric counterpart to `register_listener`.
     pub fn remove_listener(&mut self, fd: RawFd) {
         self.listeners.remove(&fd);
     }
@@ -173,6 +171,24 @@ impl Registry {
     /// Stop tracking `pipe_fd`. Called once it's removed from epoll and closed.
     pub fn unregister_cgi_fd(&mut self, pipe_fd: RawFd) {
         self.cgi_fds.remove(&pipe_fd);
+    }
+
+    /// Graceful-shutdown path: remove all listeners and connections, returning
+    /// their fds so the caller can close them.
+    ///
+    /// The returned `(listener_fds, connection_fds)` must be closed by the
+    /// caller (this method does not call `close(2)` itself).
+    pub fn drain_all(&mut self) -> (Vec<RawFd>, Vec<RawFd>) {
+        let listener_fds: Vec<RawFd> = self.listeners.keys().copied().collect();
+        for fd in &listener_fds {
+            self.remove_listener(*fd);
+        }
+
+        let conn_fds: Vec<RawFd> = self.connections.keys().copied().collect();
+        self.connections.clear();
+        self.cgi_fds.clear();
+
+        (listener_fds, conn_fds)
     }
 }
 

@@ -41,11 +41,12 @@ pub fn no_content() -> Response {
 
 /// 3xx redirect.
 ///
-/// `code` must be one of 301, 302, 307, 308 — caller is responsible for
-/// using a valid redirect code. Sends a minimal HTML body pointing at the
+/// `code` should be one of [`StatusCode::MOVED_PERMANENTLY`](301),
+/// [`StatusCode::FOUND`](302), [`StatusCode::TEMPORARY_REDIRECT`](307), or
+/// [`StatusCode::PERMANENT_REDIRECT`](308). Sends a minimal HTML body pointing at the
 /// new location.
-pub fn redirect(code: u16, location: &str) -> Response {
-    let status = StatusCode(code);
+pub fn redirect(code: StatusCode, location: &str) -> Response {
+    let status = code;
     let body   = format!(
         "<html><body>Redirecting to <a href=\"{location}\">{location}</a></body></html>"
     ).into_bytes();
@@ -110,12 +111,12 @@ pub fn internal_server_error(custom_page: Option<&str>) -> Response {
     error_from_page(StatusCode::INTERNAL_SERVER_ERROR, custom_page)
 }
 
-/// Generic numeric error response with a plain-text body.
+/// Generic typed error response with a plain-text body.
 ///
 /// Used for unusual codes where we don't have a dedicated builder and
 /// there is no custom page configured.
-pub fn error(code: u16, body: Vec<u8>) -> Response {
-    let mut resp = Response::new(StatusCode(code));
+pub fn error(code: StatusCode, body: Vec<u8>) -> Response {
+    let mut resp = Response::new(code);
     resp.headers.set("Content-Type",   "text/html; charset=utf-8");
     resp.headers.set("Content-Length", body.len().to_string());
     resp.body = body;
@@ -247,7 +248,7 @@ mod tests {
 
     #[test]
     fn redirect_sets_location_and_body() {
-        let resp = redirect(301, "/new-path");
+        let resp = redirect(StatusCode::MOVED_PERMANENTLY, "/new-path");
         assert_eq!(resp.status, StatusCode::MOVED_PERMANENTLY);
         assert_eq!(resp.headers.get("Location"), Some("/new-path"));
         assert!(!resp.body.is_empty());
@@ -279,7 +280,7 @@ mod tests {
     #[test]
     fn error_builder_with_code() {
         let body = b"<h1>503</h1>".to_vec();
-        let resp = error(503, body.clone());
+        let resp = error(StatusCode(503), body.clone());
         assert_eq!(resp.status.code(), 503);
         assert_eq!(resp.body, body);
     }

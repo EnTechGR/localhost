@@ -15,7 +15,6 @@
 ///
 /// The spec says "all I/O operations should be non-blocking". We set
 /// `O_NONBLOCK` on every fd right after creation, before any data can arrive.
-use std::ffi::CString;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 
@@ -401,11 +400,6 @@ mod tests {
 
     #[test]
     fn bind_single_listener() {
-        let configs  = vec![test_server("127.0.0.1", 0)];
-        // Port 0 lets the OS pick a free port.
-        // We can't use port 0 with our current bind path because we store the
-        // configured port — so instead we use a high ephemeral port.
-        // This test just checks no panic / error on a basic bind.
         let configs = vec![test_server("127.0.0.1", 17890)];
         let epoll    = Epoll::create().unwrap();
         let mut reg  = Registry::new();

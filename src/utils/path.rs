@@ -128,7 +128,7 @@ mod tests {
     fn resolve_safe_blocks_traversal() {
         with_tmp(|root| {
             // Create a file outside the root to traverse to.
-            let outside = format!("{root}/../outside.txt");
+            let _outside = format!("{root}/../outside.txt");
             // We don't need it to exist — the resolver should block it.
             let result = resolve_safe(root, "/../etc/passwd");
             assert!(result.is_err(), "should have blocked traversal");

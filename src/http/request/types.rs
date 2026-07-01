@@ -80,7 +80,6 @@ impl HeaderMap {
         self.inner.get(&name.to_lowercase()).map(String::as_str)
     }
 
-    /// Returns `true` if the header is present.
     pub fn contains(&self, name: &str) -> bool {
         self.inner.contains_key(&name.to_lowercase())
     }
@@ -129,6 +128,9 @@ pub struct Request {
 impl Request {
     /// Convenience: return the `Host` header value, stripped of any port.
     pub fn host(&self) -> &str {
+        if self.headers.is_empty() {
+            return "";
+        }
         self.headers
             .get("host")
             .map(|h| h.split(':').next().unwrap_or(h))
@@ -169,6 +171,24 @@ impl Request {
             .get("transfer-encoding")
             .map(|v| v.to_lowercase().contains("chunked"))
             .unwrap_or(false)
+    }
+
+    /// Returns `true` if the given header name is present (case-insensitive).
+    ///
+    /// This is a thin wrapper over [`HeaderMap::contains`] that provides a
+    /// convenient per-request API for header-presence checks. Used by the
+    /// dispatcher to validate required headers before routing.
+    pub fn has_header(&self, name: &str) -> bool {
+        self.headers.contains(name)
+    }
+
+    /// Returns `true` when the request carries **zero** headers.
+    ///
+    /// Valid HTTP/1.1 requests must include a `Host` header (RFC 7230 §5.4);
+    /// this fast-path lets the dispatcher reject headerless requests without
+    /// allocating or doing a hashmap lookup.
+    pub fn is_headerless(&self) -> bool {
+        self.headers.is_empty()
     }
 }
 
@@ -309,5 +329,36 @@ mod tests {
         let mut req = minimal_request();
         req.headers.insert("Transfer-Encoding", "chunked");
         assert!(req.is_chunked());
+    }
+
+    // ---- has_header / is_headerless ------------------------------------------
+
+    #[test]
+    fn has_header_case_insensitive() {
+        let mut req = minimal_request();
+        req.headers.insert("X-Auth-Token", "abc123");
+        assert!(req.has_header("x-auth-token"));
+        assert!(req.has_header("X-AUTH-TOKEN"));
+        assert!(!req.has_header("host"));
+    }
+
+    #[test]
+    fn is_headerless_true_for_empty() {
+        let req = minimal_request();
+        assert!(req.is_headerless());
+    }
+
+    #[test]
+    fn is_headerless_false_when_headers_exist() {
+        let mut req = minimal_request();
+        req.headers.insert("Host", "localhost");
+        assert!(!req.is_headerless());
+    }
+
+    #[test]
+    fn host_fast_path_empty() {
+        let req = minimal_request();
+        // With zero headers, this should short-circuit before the hashmap lookup.
+        assert_eq!(req.host(), "");
     }
 }

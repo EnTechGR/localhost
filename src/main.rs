@@ -8,8 +8,21 @@ mod utils;
 mod cgi;
 mod session;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use event_loop::{dispatcher, epoll::Epoll, registry::Registry};
 use server::listener::bind_listeners;
+
+/// Async-signal-safe shutdown flag setter.
+/// Called by signal handlers (SIGTERM / SIGINT).
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Signal handler — sets the global shutdown flag.
+fn handle_signal(_signum: libc::c_int) {
+    // Writing to an AtomicBool with Relaxed ordering is async-signal-safe —
+    // no malloc, no futex syscalls, just a plain memory store.
+    SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -20,6 +33,17 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // ---- 0. Install signal handlers --------------------------------------
+
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = handle_signal as *const () as usize;
+    sa.sa_flags     = libc::SA_RESTART;
+
+    unsafe {
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGINT,  &sa, std::ptr::null_mut());
+    }
 
     // ---- 1. Parse and validate config --------------------------------------
     let configs = match config::load(config_path) {
@@ -66,6 +90,8 @@ fn main() {
         }
     }
 
-    // ---- 4. Enter the event loop (never returns) ---------------------------
-    dispatcher::run(epoll, registry, configs);
+    // ---- 4. Enter the event loop -------------------------------------------
+    let exit_code = dispatcher::run(epoll, registry, configs, &SHUTDOWN_REQUESTED);
+    eprintln!("[INFO] Server stopped (exit code {exit_code})");
+    std::process::exit(exit_code);
 }

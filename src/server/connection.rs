@@ -46,10 +46,11 @@ pub enum ConnectionPhase {
 
     /// Headers parsed; reading a fixed-length body.
     ReadingBody {
-        /// Total bytes expected (from `Content-Length`).
-        expected:   usize,
-        /// Bytes in the body buffer so far.
-        bytes_read: usize,
+        /// Total bytes expected (from `Content-Length`). How many bytes
+        /// we've received so far is read directly off `read_buf.len()` by
+        /// `read_body_unchunked` — there's no separate counter to keep in
+        /// sync.
+        expected: usize,
     },
 
     /// Headers parsed; reading a `Transfer-Encoding: chunked` body.
@@ -68,11 +69,9 @@ pub enum ConnectionPhase {
         bytes_written: usize,
     },
 
-    /// CGI child forked; waiting for output on `pipe_fd`.
-    AwaitingCgi {
-        child_pid: libc::pid_t,
-        pipe_fd:   RawFd,
-    },
+    /// CGI child forked; waiting for output. Actual process state lives in
+    /// `ConnectionState::cgi` (non-blocking I/O helpers need the live fd).
+    AwaitingCgi,
 
     /// Response fully sent. Dispatcher should close or keep-alive reset.
     Done,
@@ -130,6 +129,14 @@ pub struct ConnectionState {
     /// new session was created for the in-flight request. `None` once
     /// attached (or if the request reused an existing session).
     pub pending_session_cookie: Option<crate::session::SessionId>,
+
+    /// Diagnostic metric: bytes consumed from `read_buf` during the last body
+    /// read (content-length or chunk count). Updated by `complete_body`.
+    pub body_bytes_read: usize,
+
+    /// Currently active session ID — set after session resolution and cleared
+    /// on logout. Handlers access session data through [`ConnectionState::session_data()`].
+    pub active_session_id: Option<crate::session::SessionId>,
 }
 
 
@@ -146,9 +153,11 @@ impl ConnectionState {
             local_port,
             last_activity: Instant::now(),
             peer_addr,
-            keep_alive:    false,
+            keep_alive:             false,
             cgi:                    None,
             pending_session_cookie: None,
+            active_session_id:      None,
+            body_bytes_read:        0,
         }
     }
 
@@ -174,9 +183,8 @@ impl ConnectionState {
     pub fn begin_reading_body(&mut self, req: Request, expected: usize, body_so_far: Vec<u8>) {
         self.keep_alive = req.is_keep_alive();
         self.request    = Some(req);
-        let bytes_read  = body_so_far.len();
         self.read_buf   = body_so_far;
-        self.phase      = ConnectionPhase::ReadingBody { expected, bytes_read };
+        self.phase      = ConnectionPhase::ReadingBody { expected };
     }
 
     /// Store a parsed request and transition to `ReadingChunked`.
@@ -187,28 +195,18 @@ impl ConnectionState {
         self.phase      = ConnectionPhase::ReadingChunked { assembled: body_so_far };
     }
 
-    /// Append newly-received body bytes (used in `ReadingBody`).
-    pub fn append_body_bytes(&mut self, new_bytes: &[u8]) {
-        if let ConnectionPhase::ReadingBody { ref mut bytes_read, .. } = self.phase {
-            self.read_buf.extend_from_slice(new_bytes);
-            *bytes_read += new_bytes.len();
-        }
-    }
-
-    /// Append newly-received bytes to the chunked assembler.
-    pub fn append_chunked_bytes(&mut self, new_bytes: &[u8]) {
-        if let ConnectionPhase::ReadingChunked { ref mut assembled } = self.phase {
-            assembled.extend_from_slice(new_bytes);
-        }
-    }
-
     /// Attach the decoded body to the stored request and transition to `Processing`.
-    pub fn complete_body(&mut self, body: Vec<u8>) {
+    ///
+    /// `consumed` is the number of bytes consumed from `read_buf` during body
+    /// reading (for chunked: the raw wire size including chunk boundaries; for
+    /// fixed-length: equals `body.len()`). Stored as a diagnostic metric.
+    pub fn complete_body(&mut self, body: Vec<u8>, consumed: usize) {
         if let Some(ref mut req) = self.request {
             req.body = body;
         }
         self.read_buf.clear();
-        self.phase = ConnectionPhase::Processing;
+        self.phase      = ConnectionPhase::Processing;
+        self.body_bytes_read = consumed;
     }
 
     /// Queue a serialised response and transition to `WritingResponse`.
@@ -228,6 +226,7 @@ impl ConnectionState {
             self.request = None;
             self.cgi                    = None;
             self.pending_session_cookie = None;
+            self.active_session_id      = None;
             self.phase   = ConnectionPhase::ReadingHeaders;
             self.touch();
             true
@@ -235,27 +234,6 @@ impl ConnectionState {
             self.phase = ConnectionPhase::Done;
             false
         }
-    }
-
-    /// `true` when the connection should be removed from the registry.
-    #[inline]
-    pub fn is_done(&self) -> bool {
-        matches!(self.phase, ConnectionPhase::Done)
-    }
-
-    /// `true` while we are still accumulating request data.
-    pub fn is_reading(&self) -> bool {
-        matches!(
-            self.phase,
-            ConnectionPhase::ReadingHeaders
-                | ConnectionPhase::ReadingBody { .. }
-                | ConnectionPhase::ReadingChunked { .. }
-        )
-    }
-
-    /// `true` while we are writing the response.
-    pub fn is_writing(&self) -> bool {
-        matches!(self.phase, ConnectionPhase::WritingResponse { .. })
     }
 }
 
@@ -320,7 +298,7 @@ mod tests {
     fn begin_reading_body_stores_request_and_phase() {
         let mut c = make_conn();
         c.begin_reading_body(minimal_request(), 10, b"hello".to_vec());
-        assert!(matches!(c.phase, ConnectionPhase::ReadingBody { expected: 10, bytes_read: 5 }));
+        assert!(matches!(c.phase, ConnectionPhase::ReadingBody { expected: 10 }));
         assert!(c.request.is_some());
         assert_eq!(c.read_buf, b"hello");
     }
@@ -334,19 +312,25 @@ mod tests {
     }
 
     #[test]
-    fn append_body_bytes_extends_read_buf() {
+    fn append_chunked_bytes_extends_assembled() {
         let mut c = make_conn();
-        c.begin_reading_body(minimal_request(), 10, b"hel".to_vec());
-        c.append_body_bytes(b"lo");
-        assert_eq!(c.read_buf, b"hello");
-        assert!(matches!(c.phase, ConnectionPhase::ReadingBody { bytes_read: 5, .. }));
+        c.begin_reading_chunked(minimal_request(), b"5\r\nhel".to_vec());
+        if let ConnectionPhase::ReadingChunked { ref mut assembled } = c.phase {
+            assembled.extend_from_slice(b"lo\r\n0\r\n\r\n");
+        }
+        match &c.phase {
+            ConnectionPhase::ReadingChunked { assembled } => {
+                assert_eq!(assembled, b"5\r\nhello\r\n0\r\n\r\n");
+            }
+            other => panic!("expected ReadingChunked, got {other:?}"),
+        }
     }
 
     #[test]
     fn complete_body_attaches_body_and_sets_processing() {
         let mut c = make_conn();
         c.request = Some(minimal_request());
-        c.complete_body(b"world".to_vec());
+        c.complete_body(b"world".to_vec(), 5);
         assert!(matches!(c.phase, ConnectionPhase::Processing));
         assert_eq!(c.request.as_ref().unwrap().body, b"world");
         assert!(c.read_buf.is_empty());
@@ -365,7 +349,7 @@ mod tests {
         let mut c = make_conn();
         c.keep_alive = false;
         assert!(!c.finish());
-        assert!(c.is_done());
+        assert!(matches!(c.phase, ConnectionPhase::Done));
     }
 
     #[test]
@@ -376,35 +360,11 @@ mod tests {
         c.read_buf   = b"leftover".to_vec();
         c.write_buf  = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
         assert!(c.finish());
-        assert!(!c.is_done());
+        assert!(!matches!(c.phase, ConnectionPhase::Done));
         assert!(c.request.is_none());
         assert!(c.read_buf.is_empty());
         assert!(c.write_buf.is_empty());
         assert!(matches!(c.phase, ConnectionPhase::ReadingHeaders));
-    }
-
-    #[test]
-    fn is_reading_correct_phases() {
-        let mut c = make_conn();
-        assert!(c.is_reading()); // ReadingHeaders
-        c.phase = ConnectionPhase::ReadingBody { expected: 5, bytes_read: 0 };
-        assert!(c.is_reading());
-        c.phase = ConnectionPhase::ReadingChunked { assembled: vec![] };
-        assert!(c.is_reading());
-        c.phase = ConnectionPhase::WritingResponse { bytes_written: 0 };
-        assert!(!c.is_reading());
-        c.phase = ConnectionPhase::Done;
-        assert!(!c.is_reading());
-    }
-
-    #[test]
-    fn is_writing_only_in_writing_phase() {
-        let mut c = make_conn();
-        assert!(!c.is_writing());
-        c.phase = ConnectionPhase::WritingResponse { bytes_written: 0 };
-        assert!(c.is_writing());
-        c.phase = ConnectionPhase::Done;
-        assert!(!c.is_writing());
     }
 
     #[test]

@@ -22,8 +22,10 @@ pub type SessionId = String;
 #[derive(Debug)]
 pub struct SessionData {
     /// Arbitrary key-value pairs stored by the application or handlers.
+    #[allow(dead_code)] // intentionally public API: handlers use this to store/retrieve data
     pub values: HashMap<String, String>,
     /// When this session was first created.
+    #[allow(dead_code)] // intentionally public API: consumers inspect for session age
     pub created: Instant,
     /// When this session was last read or written.
     pub last_accessed: Instant,
@@ -71,6 +73,7 @@ impl SessionStore {
     }
 
     /// Look up a session by ID (immutable). Does **not** update timestamps.
+    #[allow(dead_code)] // intentionally public API: external consumers may look up sessions
     pub fn get(&self, id: &str) -> Option<&SessionData> {
         self.sessions.get(id)
     }
@@ -84,6 +87,7 @@ impl SessionStore {
     }
 
     /// Remove a session.
+    #[allow(dead_code)] // intentionally public API: external consumers may destroy sessions
     pub fn destroy(&mut self, id: &str) {
         self.sessions.remove(id);
     }
@@ -97,11 +101,13 @@ impl SessionStore {
     }
 
     /// Number of active sessions.
+    #[allow(dead_code)] // intentionally public API: external consumers may enumerate session count
     pub fn len(&self) -> usize {
         self.sessions.len()
     }
 
     /// Whether the store contains no sessions.
+    #[allow(dead_code)] // intentionally public API: external consumers may check for empty store
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
     }

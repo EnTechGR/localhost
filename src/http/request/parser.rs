@@ -24,6 +24,15 @@ use crate::config::types::Method;
 /// Requests exceeding this get a 431 / 400 response.
 pub const MAX_HEADER_BYTES: usize = 16_384; // 16 KiB
 
+/// Maximum URI length (request line). Exceeding this returns **414 URI Too Long**.
+/// Matches NGINX's `large_client_header_buffers` default (8 KiB per line).
+pub const MAX_URI_BYTES: usize = 8_192;
+
+/// Maximum number of individual headers in a request.
+/// Prevents header-flooding attacks that bypass the byte limit with many
+/// tiny headers (e.g. thousands of `X-Token-N: value` headers).
+pub const MAX_HEADER_ENTRIES: usize = 256;
+
 // ---------------------------------------------------------------------------
 // ParseResult
 // ---------------------------------------------------------------------------
@@ -100,6 +109,15 @@ pub fn parse_request_head(buf: &[u8]) -> ParseResult {
         Err(e) => return ParseResult::Error(e),
     };
 
+    // Validate Content-Length: must be a non-negative integer if present.
+    if let Some(cl_raw) = headers.get("content-length") {
+        if cl_raw.trim().parse::<usize>().is_err() {
+            return ParseResult::Error(ParseError::BadContentLength(
+                cl_raw.to_string(),
+            ));
+        }
+    }
+
     let request = Request {
         method,
         path,
@@ -134,6 +152,12 @@ pub fn parse_request_line(
     // URI: split on '?' to separate path from query string.
     if uri.is_empty() {
         return Err(ParseError::BadUri("empty URI".into()));
+    }
+    if uri.len() > MAX_URI_BYTES {
+        return Err(ParseError::BadRequestLine(format!(
+            "URI too long ({} bytes, max {})",
+            uri.len(), MAX_URI_BYTES
+        )));
     }
     let (raw_path, query) = match uri.find('?') {
         Some(pos) => (&uri[..pos], uri[pos + 1..].to_string()),
@@ -201,6 +225,10 @@ pub fn parse_headers(lines: &[&str]) -> Result<HeaderMap, ParseError> {
         }
 
         map.insert(name, value.trim());
+        // Reject header-flooding attacks that use many small headers.
+        if map.len() > MAX_HEADER_ENTRIES {
+            return Err(ParseError::HeadersTooLarge);
+        }
     }
 
     Ok(map)
@@ -337,43 +365,43 @@ mod tests {
 
     #[test]
     fn parses_basic_headers() {
-        let lines = vec!["Host: example.com", "Content-Type: text/plain"];
-        let map = parse_headers(&lines).unwrap();
+        let _lines = vec!["Host: example.com", "Content-Type: text/plain"];
+        let map = parse_headers(&_lines).unwrap();
         assert_eq!(map.get("host"), Some("example.com"));
         assert_eq!(map.get("content-type"), Some("text/plain"));
     }
 
     #[test]
     fn trims_header_value_whitespace() {
-        let lines = vec!["  X-Custom:   value with spaces   "];
+        let _lines = vec!["  X-Custom:   value with spaces   "];
         // Leading spaces trigger fold rejection, so use a valid line.
-        let lines = vec!["X-Custom:   value with spaces   "];
-        let map = parse_headers(&lines).unwrap();
+        let _lines = vec!["X-Custom:   value with spaces   "];
+        let map = parse_headers(&_lines).unwrap();
         assert_eq!(map.get("x-custom"), Some("value with spaces"));
     }
 
     #[test]
     fn rejects_header_without_colon() {
-        let lines = vec!["BadHeader"];
-        assert!(parse_headers(&lines).is_err());
+        let _lines = vec!["BadHeader"];
+        assert!(parse_headers(&_lines).is_err());
     }
 
     #[test]
     fn rejects_whitespace_before_colon() {
-        let lines = vec!["Name : value"];
-        assert!(parse_headers(&lines).is_err());
+        let _lines = vec!["Name : value"];
+        assert!(parse_headers(&_lines).is_err());
     }
 
     #[test]
     fn rejects_obsolete_folding() {
-        let lines = vec![" continuation value"];
-        assert!(parse_headers(&lines).is_err());
+        let _lines = vec![" continuation value"];
+        assert!(parse_headers(&_lines).is_err());
     }
 
     #[test]
     fn skips_empty_lines() {
-        let lines = vec!["Host: example.com", "", "Connection: close"];
-        let map = parse_headers(&lines).unwrap();
+        let _lines = vec!["Host: example.com", "", "Connection: close"];
+        let map = parse_headers(&_lines).unwrap();
         assert_eq!(map.len(), 2);
     }
 
@@ -458,5 +486,28 @@ mod tests {
     fn returns_none_without_double_crlf() {
         let buf = b"HEAD\r\n";
         assert_eq!(super::find_header_end(buf), None);
+    }
+
+    // ---- MAX_HEADER_ENTRIES -------------------------------------------------
+
+    #[test]
+    fn max_header_entries_rejected() {
+        // Build more than MAX_HEADER_ENTRIES headers (each small enough to
+        // avoid the byte limit).
+        let lines: Vec<String> = (0..MAX_HEADER_ENTRIES + 1)
+            .map(|i| format!("X-Key-{i}: val"))
+            .collect();
+        let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        assert!(parse_headers(&line_refs).is_err());
+    }
+
+    #[test]
+    fn max_header_entries_boundary_ok() {
+        // Exactly MAX_HEADER_ENTRIES should be accepted.
+        let lines: Vec<String> = (0..MAX_HEADER_ENTRIES)
+            .map(|i| format!("X-Key-{i}: val"))
+            .collect();
+        let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        assert!(parse_headers(&line_refs).is_ok());
     }
 }
